@@ -106,6 +106,9 @@ List of sub-commands:
 	exec command [args...]
 		Execute a command against the language server, args must be valid
 		JSON of any type.
+
+	sym [-p] pattern
+		Search globally for symbols matching pattern.
 `
 
 func usage() {
@@ -202,6 +205,12 @@ func run(cfg *config.Config, args []string) error {
 			return acmelsp.Assist(sm, args[0])
 		}
 		return fmt.Errorf("unknown assist command %q", args[0])
+	case "sym":
+		args = args[1:]
+		if len(args) > 1 && args[0] == "-p" {
+			return acmelsp.Symbol(server, args[1], true)
+		}
+		return acmelsp.Symbol(server, args[0], false)
 	}
 
 	winid, err := getWinID()
