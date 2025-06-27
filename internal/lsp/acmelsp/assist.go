@@ -2,13 +2,15 @@ package acmelsp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"os"
 	"time"
 	"unicode"
-	"os"
+	"strings"
 
 	"9fans.net/acme-lsp/internal/acme"
 	"9fans.net/acme-lsp/internal/acmeutil"
@@ -300,6 +302,32 @@ func Symbol(server proxy.Server, query string, print bool) error {
 		return PrintLocations(os.Stdout, locations)
 	}
 	return PlumbLocations(locations)
+}
+
+func Execute(server proxy.Server, serverID string, command string, args []string) error {
+	jargs := []json.RawMessage{}
+	for _, arg := range args {
+		var r json.RawMessage
+		err := json.NewDecoder(strings.NewReader(arg)).Decode(&r)
+		if err != nil {
+			return err
+		}
+		jargs = append(jargs, r)
+	}
+
+	resp, err := server.ExecuteCommandOnServer(context.Background(), &proxy.ExecuteCommandOnServerParams{
+		Server: proxy.ServerIdentifier{
+			ID: serverID,
+		},
+		ExecuteCommandParams: protocol.ExecuteCommandParams{
+			Command:   command,
+			Arguments: jargs,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(resp)
 }
 
 // ServerMatcher represents a set of servers where it's possible to

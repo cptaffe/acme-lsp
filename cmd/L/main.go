@@ -211,6 +211,11 @@ func run(cfg *config.Config, args []string) error {
 			return acmelsp.Symbol(server, args[1], true)
 		}
 		return acmelsp.Symbol(server, args[0], false)
+	case "exec":
+		args = args[1:]
+		if len(args) >= 4 && args[0] == "-s" {
+			return acmelsp.Execute(server, args[1], args[2], args[3:])
+		}
 	}
 
 	winid, err := getWinID()
