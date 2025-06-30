@@ -212,9 +212,9 @@ func run(cfg *config.Config, args []string) error {
 		}
 		return acmelsp.Symbol(server, args[0], false)
 	case "exec":
-		args = args[1:]
-		if len(args) >= 4 && args[0] == "-s" {
-			return acmelsp.Execute(server, args[1], args[2], args[3:])
+		// exec -s serverID command args...
+		if len(args) >= 4 && args[1] == "-s" {
+			return acmelsp.Execute(server, args[2], args[3], args[4:])
 		}
 	}
 
