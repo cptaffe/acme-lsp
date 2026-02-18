@@ -155,10 +155,11 @@ func (info *ServerInfo) start(cfg *ClientConfig) (*Server, error) {
 // ServerSet holds information about a set of LSP servers and connection to them,
 // which are created on-demand.
 type ServerSet struct {
-	Data       []*ServerInfo
-	diagWriter DiagnosticsWriter
-	workspaces map[string]*protocol.WorkspaceFolder // set of workspace folders
-	cfg        *config.Config
+	Data            []*ServerInfo
+	diagWriter      DiagnosticsWriter
+	tokensRefresher SemanticTokensRefresher // notified on workspace/semanticTokens/refresh
+	workspaces      map[string]*protocol.WorkspaceFolder // set of workspace folders
+	cfg             *config.Config
 }
 
 // NewServerSet creates a new server set from config.
@@ -240,6 +241,7 @@ func (ss *ServerSet) ClientConfig(info *ServerInfo) *ClientConfig {
 		DiagWriter:      ss.diagWriter,
 		Workspaces:      ss.Workspaces(),
 		Logger:          info.Logger,
+		TokensRefresher: ss.tokensRefresher,
 	}
 }
 

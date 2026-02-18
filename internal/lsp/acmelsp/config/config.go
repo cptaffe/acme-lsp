@@ -44,6 +44,10 @@ type File struct {
 	// Root directory used for LSP initialization.
 	RootDirectory string
 
+	// Path to the acme style file used for semantic token highlighting.
+	// Same format as acme's -s flag.  Leave empty to disable highlighting.
+	StyleFile string
+
 	// Don't show diagnostics sent by the LSP server.
 	HideDiagnostics bool
 
@@ -250,6 +254,7 @@ func (cfg *Config) ParseFlags(flags Flags, f *flag.FlagSet, arguments []string) 
 		"address where acme is serving 9P file system")
 	f.BoolVar(&cfg.Verbose, "v", cfg.Verbose, "Verbose output")
 	f.BoolVar(&cfg.ShowConfig, "showconfig", false, "show configuration values and exit")
+	f.StringVar(&cfg.StyleFile, "styles", cfg.StyleFile, "path to acme style file for semantic token highlighting")
 
 	if flags&ProxyFlags != 0 {
 		f.StringVar(&cfg.ProxyNetwork, "proxy.net", cfg.ProxyNetwork,

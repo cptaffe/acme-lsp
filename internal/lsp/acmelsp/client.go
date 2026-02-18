@@ -25,12 +25,20 @@ type DiagnosticsWriter interface {
 
 // clientHandler handles JSON-RPC requests and notifications.
 type clientHandler struct {
-	cfg        *ClientConfig
-	hideDiag   bool
-	diagWriter DiagnosticsWriter
-	diag       map[protocol.DocumentURI][]protocol.Diagnostic
-	mu         sync.Mutex
+	cfg             *ClientConfig
+	hideDiag        bool
+	diagWriter      DiagnosticsWriter
+	diag            map[protocol.DocumentURI][]protocol.Diagnostic
+	mu              sync.Mutex
+	tokensRefresher SemanticTokensRefresher
 	proxy.NotImplementedClient
+}
+
+func (h *clientHandler) SemanticTokensRefresh(ctx context.Context) error {
+	if h.tokensRefresher != nil {
+		h.tokensRefresher.RefreshSemanticTokens()
+	}
+	return nil
 }
 
 func (h *clientHandler) ShowMessage(ctx context.Context, params *protocol.ShowMessageParams) error {
@@ -90,16 +98,23 @@ func (h *clientHandler) ApplyEdit(ctx context.Context, params *protocol.ApplyWor
 	return &protocol.ApplyWorkspaceEditResult{Applied: true}, nil
 }
 
+// SemanticTokensRefresher is notified when the server sends
+// workspace/semanticTokens/refresh.
+type SemanticTokensRefresher interface {
+	RefreshSemanticTokens()
+}
+
 // ClientConfig contains LSP client configuration values.
 type ClientConfig struct {
 	*config.Server
 	*config.FilenameHandler
-	RootDirectory string                     // used to compute RootURI in initialization
-	HideDiag      bool                       // don't write diagnostics to DiagWriter
-	RPCTrace      bool                       // print LSP rpc trace to stderr
-	DiagWriter    DiagnosticsWriter          // notification handler writes diagnostics here
-	Workspaces    []protocol.WorkspaceFolder // initial workspace folders
-	Logger        *log.Logger
+	RootDirectory      string                     // used to compute RootURI in initialization
+	HideDiag           bool                       // don't write diagnostics to DiagWriter
+	RPCTrace           bool                       // print LSP rpc trace to stderr
+	DiagWriter         DiagnosticsWriter          // notification handler writes diagnostics here
+	Workspaces         []protocol.WorkspaceFolder // initial workspace folders
+	Logger             *log.Logger
+	TokensRefresher    SemanticTokensRefresher    // called on workspace/semanticTokens/refresh; may be nil
 }
 
 // Client represents a LSP client connection.
@@ -126,10 +141,11 @@ func (c *Client) init(conn net.Conn, cfg *ClientConfig) error {
 	ctx := context.Background()
 	stream := jsonrpc2.NewBufferedStream(conn, jsonrpc2.VSCodeObjectCodec{})
 	handler := proxy.NewClientHandler(&clientHandler{
-		cfg:        cfg,
-		hideDiag:   cfg.HideDiag,
-		diagWriter: cfg.DiagWriter,
-		diag:       make(map[protocol.DocumentURI][]protocol.Diagnostic),
+		cfg:             cfg,
+		hideDiag:        cfg.HideDiag,
+		diagWriter:      cfg.DiagWriter,
+		diag:            make(map[protocol.DocumentURI][]protocol.Diagnostic),
+		tokensRefresher: cfg.TokensRefresher,
 	})
 	var opts []jsonrpc2.ConnOpt
 	if cfg.RPCTrace {
@@ -174,9 +190,26 @@ func (c *Client) init(conn net.Conn, cfg *ClientConfig) error {
 						},
 					},
 					SemanticTokens: protocol.SemanticTokensClientCapabilities{
-						Formats:        []protocol.TokenFormat{},
-						TokenModifiers: []string{},
-						TokenTypes:     []string{},
+						Formats: []protocol.TokenFormat{"relative"},
+						Requests: protocol.PRequestsPSemanticTokens{
+							Full: protocol.Or_SemanticTokensClientCapabilities_requests_full{
+								Value: true,
+							},
+						},
+						MultilineTokenSupport:  true,
+						OverlappingTokenSupport: true,
+						TokenTypes: []string{
+							"namespace", "type", "class", "enum", "interface",
+							"struct", "typeParameter", "parameter", "variable",
+							"property", "enumMember", "event", "function",
+							"method", "macro", "keyword", "modifier", "comment",
+							"string", "number", "regexp", "operator", "decorator",
+						},
+						TokenModifiers: []string{
+							"declaration", "definition", "readonly", "static",
+							"deprecated", "abstract", "async", "modification",
+							"documentation", "defaultLibrary",
+						},
 					},
 				},
 				Workspace: protocol.WorkspaceClientCapabilities{
