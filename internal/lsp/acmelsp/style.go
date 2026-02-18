@@ -51,6 +51,12 @@ func LoadStyleFile(path string) (StyleMap, error) {
 // initialization result.  SemanticTokensProvider is typed interface{} in the
 // protocol library; re-marshalling through JSON is the standard way to obtain
 // a typed value from the decoded map[string]interface{}.
+//
+// We unmarshal only the "legend" sub-object rather than the full
+// SemanticTokensOptions so that servers like clangd that return scalar values
+// for optional fields (e.g. "range": false) don't trip up the decoder — the
+// protocol library's Or_SemanticTokensOptions_range type expects a JSON object,
+// not a boolean, and json.Unmarshal returns an error on mismatch.
 func semanticLegend(caps protocol.ServerCapabilities) (*protocol.SemanticTokensLegend, bool) {
 	if caps.SemanticTokensProvider == nil {
 		return nil, false
@@ -59,14 +65,16 @@ func semanticLegend(caps protocol.ServerCapabilities) (*protocol.SemanticTokensL
 	if err != nil {
 		return nil, false
 	}
-	var opts protocol.SemanticTokensOptions
-	if err := json.Unmarshal(b, &opts); err != nil {
+	var wrapper struct {
+		Legend protocol.SemanticTokensLegend `json:"legend"`
+	}
+	if err := json.Unmarshal(b, &wrapper); err != nil {
 		return nil, false
 	}
-	if len(opts.Legend.TokenTypes) == 0 {
+	if len(wrapper.Legend.TokenTypes) == 0 {
 		return nil, false
 	}
-	return &opts.Legend, true
+	return &wrapper.Legend, true
 }
 
 // runeOffsets maps line numbers to rune offsets for translating LSP
@@ -246,9 +254,41 @@ func buildStyleCmds(data []uint32, legend *protocol.SemanticTokensLegend, sm Sty
 	return cmds
 }
 
+// applyTokenEdits applies a slice of LSP SemanticTokensEdit operations to the
+// previous flat token data array.  Edits are applied in reverse index order so
+// that later splice positions are not invalidated by earlier ones.
+func applyTokenEdits(prev []uint32, edits []protocol.SemanticTokensEdit) []uint32 {
+	out := make([]uint32, len(prev))
+	copy(out, prev)
+	for i := len(edits) - 1; i >= 0; i-- {
+		e := edits[i]
+		start := int(e.Start)
+		end := start + int(e.DeleteCount)
+		if start > len(out) {
+			start = len(out)
+		}
+		if end > len(out) {
+			end = len(out)
+		}
+		var next []uint32
+		next = append(next, out[:start]...)
+		next = append(next, e.Data...)
+		next = append(next, out[end:]...)
+		out = next
+	}
+	return out
+}
+
 // ApplySemanticTokens fetches semantic tokens for the named document from the
 // LSP server and writes the corresponding style ctl commands to the acme window.
-func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name string, sm StyleMap) error {
+//
+// ts is the per-file token cache.  When ts holds a non-empty resultID from a
+// previous response the function requests a delta update
+// (textDocument/semanticTokens/full/delta) and applies the edit list to the
+// cached data; this is more efficient than a full request for large files.
+// A full request is used when ts is nil, when no resultID is cached, or when
+// the delta request fails.
+func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name string, sm StyleMap, ts *tokenState) error {
 	if len(sm) == 0 {
 		return nil
 	}
@@ -257,28 +297,81 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 		return nil
 	}
 
-	result, err := c.SemanticTokensFull(ctx, &protocol.SemanticTokensParams{
-		TextDocument: protocol.TextDocumentIdentifier{
-			URI: text.ToURI(name),
-		},
-	})
-	if err != nil {
-		if Verbose {
-			log.Printf("SemanticTokensFull %v: %v", name, err)
-		}
-		return nil // non-fatal: server may not be ready yet
-	}
-	if result == nil || len(result.Data) == 0 {
-		// No tokens — clear any existing highlights.
-		return w.Ctl("style 0")
-	}
-
 	body, err := w.ReadAll("body")
 	if err != nil {
 		return fmt.Errorf("reading body: %v", err)
 	}
 
-	cmds := buildStyleCmds(result.Data, legend, sm, body)
+	// Retrieve cached state under the token-state lock.
+	var prevResultID string
+	var prevData []uint32
+	if ts != nil {
+		ts.mu.Lock()
+		prevResultID = ts.resultID
+		prevData = ts.data
+		ts.mu.Unlock()
+	}
+
+	var data []uint32
+	var newResultID string
+
+	if prevResultID != "" {
+		// Attempt a delta request using the previous resultId.
+		raw, err := c.SemanticTokensFullDelta(ctx, &protocol.SemanticTokensDeltaParams{
+			TextDocument:     protocol.TextDocumentIdentifier{URI: text.ToURI(name)},
+			PreviousResultID: prevResultID,
+		})
+		if err == nil && raw != nil {
+			b, _ := json.Marshal(raw)
+			// Distinguish a SemanticTokensDelta (has "edits") from a SemanticTokens
+			// (has "data") by checking which key is present.
+			var peek struct {
+				Edits *json.RawMessage `json:"edits"`
+			}
+			json.Unmarshal(b, &peek) //nolint:errcheck
+			if peek.Edits != nil {
+				var delta protocol.SemanticTokensDelta
+				if json.Unmarshal(b, &delta) == nil {
+					data = applyTokenEdits(prevData, delta.Edits)
+					newResultID = delta.ResultID
+				}
+			} else {
+				var full protocol.SemanticTokens
+				if json.Unmarshal(b, &full) == nil && len(full.Data) > 0 {
+					data = full.Data
+					newResultID = full.ResultID
+				}
+			}
+		}
+	}
+
+	if data == nil {
+		// Fall back to a full token request.
+		result, err := c.SemanticTokensFull(ctx, &protocol.SemanticTokensParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: text.ToURI(name)},
+		})
+		if err != nil {
+			if Verbose {
+				log.Printf("SemanticTokensFull %v: %v", name, err)
+			}
+			return nil // non-fatal: server may not be ready yet
+		}
+		if result == nil || len(result.Data) == 0 {
+			return w.Ctl("style 0")
+		}
+		data = result.Data
+		newResultID = result.ResultID
+	}
+
+	// Persist the updated result for the next delta request.
+	if ts != nil && newResultID != "" {
+		ts.mu.Lock()
+		ts.resultID = newResultID
+		ts.data = data
+		ts.mu.Unlock()
+	}
+
+	cmds := buildStyleCmds(data, legend, sm, body)
 
 	// Clear existing highlights first, then apply the new ones in batches.
 	// Each batch is a separate ctl write so ctlstyleparse's fixed 256-triple

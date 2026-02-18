@@ -2,9 +2,11 @@ package acmelsp
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"9fans.net/acme-lsp/internal/acme"
 	"9fans.net/acme-lsp/internal/acmeutil"
@@ -14,6 +16,14 @@ import (
 	"9fans.net/internal/go-lsp/lsp/protocol"
 )
 
+// tokenState caches the last semantic-token response for a file so that
+// subsequent requests can use the LSP delta protocol.
+type tokenState struct {
+	mu       sync.Mutex
+	resultID string   // resultId from the last server response
+	data     []uint32 // flat token data from the last full or reconstructed response
+}
+
 // FileManager keeps track of open files in acme.
 // It is used to synchronize text with LSP server.
 //
@@ -21,10 +31,12 @@ import (
 // because having the ctl file open prevents del event from
 // being delivered to acme/log file.
 type FileManager struct {
-	ss     *ServerSet
-	wins   map[string]struct{} // set of open files
-	mu     sync.Mutex
-	styles StyleMap // name→index from acme style file; nil if not configured
+	ss          *ServerSet
+	wins        map[string]struct{} // set of open files
+	mu          sync.Mutex
+	styles      StyleMap            // name→index from acme style file; nil if not configured
+	tokenStates map[string]*tokenState // cached token state per file; access protected by mu
+	watchers    map[string]chan struct{} // stop channels for per-window body watchers; access protected by mu
 
 	cfg *config.Config
 }
@@ -32,9 +44,11 @@ type FileManager struct {
 // NewFileManager creates a new file manager, initialized with files currently open in acme.
 func NewFileManager(ss *ServerSet, cfg *config.Config) (*FileManager, error) {
 	fm := &FileManager{
-		ss:   ss,
-		wins: make(map[string]struct{}),
-		cfg:  cfg,
+		ss:          ss,
+		wins:        make(map[string]struct{}),
+		tokenStates: make(map[string]*tokenState),
+		watchers:    make(map[string]chan struct{}),
+		cfg:         cfg,
 	}
 
 	if cfg.StyleFile != "" {
@@ -134,6 +148,7 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 			return fmt.Errorf("file already open in file manager: %v", name)
 		}
 		fm.wins[name] = struct{}{}
+		fm.tokenStates[name] = &tokenState{}
 
 		b, err := w.ReadAll("body")
 		if err != nil {
@@ -144,8 +159,86 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 	if err != nil {
 		return err
 	}
+
+	// Start a background watcher so edits trigger style updates without a save.
+	if len(fm.styles) > 0 {
+		stop := make(chan struct{})
+		fm.mu.Lock()
+		fm.watchers[name] = stop
+		fm.mu.Unlock()
+		go fm.watchBody(winid, name, stop)
+	}
+
 	fm.applyStyles(winid, name)
 	return nil
+}
+
+// watchBody polls the body of window winid every 300 ms.  When the content
+// changes it sends textDocument/didChange to the LSP server immediately and
+// then waits 750 ms of inactivity before re-requesting semantic tokens.
+func (fm *FileManager) watchBody(winid int, name string, stop <-chan struct{}) {
+	const (
+		pollInterval  = 300 * time.Millisecond
+		debounceDelay = 750 * time.Millisecond
+	)
+
+	var lastHash [32]byte
+	var debounce <-chan time.Time
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+
+		case <-ticker.C:
+			w, err := acmeutil.OpenWin(winid)
+			if err != nil {
+				return // window gone
+			}
+			body, err := w.ReadAll("body")
+			w.CloseFiles()
+			if err != nil {
+				continue
+			}
+
+			h := sha256.Sum256(body)
+			if h == lastHash {
+				continue
+			}
+			lastHash = h
+
+			// Notify the LSP server of the change asynchronously.
+			go fm.notifyDidChange(name, body)
+
+			// Reset the debounce: request new tokens after 750 ms of quiet.
+			debounce = time.After(debounceDelay)
+
+		case <-debounce:
+			debounce = nil
+			fm.applyStyles(winid, name)
+		}
+	}
+}
+
+// notifyDidChange sends a textDocument/didChange notification with the given
+// body content.  It is called from a goroutine inside watchBody.
+func (fm *FileManager) notifyDidChange(name string, body []byte) {
+	fm.mu.Lock()
+	_, open := fm.wins[name]
+	fm.mu.Unlock()
+	if !open {
+		return
+	}
+	s, found, err := fm.ss.StartForFile(name)
+	if !found || err != nil {
+		return
+	}
+	if err := lsp.DidChange(context.Background(), s.Client, name, body); err != nil && Verbose {
+		log.Printf("notifyDidChange %v: %v", name, err)
+	}
 }
 
 // applyStyles fetches semantic tokens for the named window and applies the
@@ -155,11 +248,15 @@ func (fm *FileManager) applyStyles(winid int, name string) {
 	if len(fm.styles) == 0 {
 		return
 	}
+	fm.mu.Lock()
+	ts := fm.tokenStates[name]
+	fm.mu.Unlock()
+
 	go func() {
 		err := fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
-			return ApplySemanticTokens(context.Background(), c, w, name, fm.styles)
+			return ApplySemanticTokens(context.Background(), c, w, name, fm.styles, ts)
 		})
-		if err != nil && Verbose {
+		if err != nil {
 			log.Printf("applyStyles %v: %v", name, err)
 		}
 	}()
@@ -195,12 +292,20 @@ func (fm *FileManager) RefreshSemanticTokens() {
 
 func (fm *FileManager) didClose(name string) error {
 	fm.mu.Lock()
-	defer fm.mu.Unlock()
+
+	// Stop the body watcher if one is running for this file.
+	if stop, ok := fm.watchers[name]; ok {
+		close(stop)
+		delete(fm.watchers, name)
+	}
+	delete(fm.tokenStates, name)
 
 	if _, ok := fm.wins[name]; !ok {
+		fm.mu.Unlock()
 		return nil // Unknown language server.
 	}
 	delete(fm.wins, name)
+	fm.mu.Unlock()
 
 	return fm.withClient(-1, name, func(c *Client, _ *acmeutil.Win) error {
 		return lsp.DidClose(context.Background(), c, name)
