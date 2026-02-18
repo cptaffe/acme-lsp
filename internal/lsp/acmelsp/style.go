@@ -2,7 +2,6 @@ package acmelsp
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -143,15 +142,11 @@ func blankLinesOnly(body []byte, ro *runeOffsets, gapStart, gapEnd int) bool {
 	return true
 }
 
-// buildStyleCmd converts the encoded LSP semantic token data into an acme
-// style ctl command.
-//
-// The acme style command format used here is:
-//
-//	style <idx> <start> <len> [<idx> <start> <len> ...]
-//
-// Every entry carries an absolute start position so non-contiguous ranges
-// require no gap-filling.  Returns "" if there are no mapped tokens.
+// MaxStyleTriples is the maximum number of (index, start, length) triples
+// that fit in a single style ctl write.  ctlstyleparse in acme declares a
+// fixed buffer of 768 ulongs, which holds exactly 256 triples.
+const MaxStyleTriples = 256
+
 // styleToken holds a resolved token ready for emission.
 type styleToken struct {
 	styleIdx int
@@ -159,7 +154,17 @@ type styleToken struct {
 	length   int // runes
 }
 
-func buildStyleCmd(data []uint32, legend *protocol.SemanticTokensLegend, sm StyleMap, body []byte) string {
+// buildStyleCmds converts the encoded LSP semantic token data into one or
+// more acme style ctl commands, each containing at most MaxStyleTriples
+// triples so that ctlstyleparse never overflows its fixed buffer.
+//
+// The acme style command format used here is:
+//
+//	style <idx> <start> <len> [<idx> <start> <len> ...]
+//
+// Every entry carries an absolute start position so non-contiguous ranges
+// require no gap-filling.  Returns nil if there are no mapped tokens.
+func buildStyleCmds(data []uint32, legend *protocol.SemanticTokensLegend, sm StyleMap, body []byte) []string {
 	ro := buildRuneOffsets(body)
 
 	// First pass: decode the relative encoding into absolute tokens.
@@ -195,29 +200,14 @@ func buildStyleCmd(data []uint32, legend *protocol.SemanticTokensLegend, sm Styl
 		})
 	}
 
-	// Second pass: emit tokens, merging adjacent runs of the same style that
-	// are separated only by blank lines.  gopls returns one token per line for
-	// multi-line constructs (e.g. backtick strings, block comments) and emits
-	// nothing for blank lines within them, even when multilineTokenSupport is
-	// advertised.  We fill those gaps so the blank lines stay styled.
-	var b bytes.Buffer
-	emit := func(idx, start, length int) {
-		if b.Len() == 0 {
-			fmt.Fprintf(&b, "style %d %d %d", idx, start, length)
-		} else {
-			fmt.Fprintf(&b, " %d %d %d", idx, start, length)
-		}
-	}
-
+	// Second pass: merge adjacent runs of the same style separated only by
+	// blank lines.  gopls returns one token per line for multi-line constructs
+	// (backtick strings, block comments) and emits nothing for blank lines
+	// within them, even when multilineTokenSupport is advertised.
+	merged := make([]styleToken, 0, len(tokens))
 	for i := 0; i < len(tokens); i++ {
 		t := tokens[i]
-		start := t.start
 		end := t.start + t.length
-
-		// Absorb any following tokens of the same style where the only gap
-		// between them consists of blank lines.  gopls returns one token per
-		// line for multi-line constructs and emits nothing for blank lines,
-		// even with multilineTokenSupport advertised.
 		for j := i + 1; j < len(tokens); j++ {
 			next := tokens[j]
 			if next.styleIdx != t.styleIdx {
@@ -226,14 +216,34 @@ func buildStyleCmd(data []uint32, legend *protocol.SemanticTokensLegend, sm Styl
 			if !blankLinesOnly(body, ro, end, next.start) {
 				break
 			}
-			// Gap is blank-lines only — extend to cover it.
 			end = next.start + next.length
 			i = j
 		}
-
-		emit(t.styleIdx, start, end-start)
+		merged = append(merged, styleToken{t.styleIdx, t.start, end - t.start})
 	}
-	return b.String()
+
+	if len(merged) == 0 {
+		return nil
+	}
+
+	// Third pass: split merged tokens into batches of at most MaxStyleTriples
+	// so each ctl write fits within ctlstyleparse's fixed buffer.
+	var cmds []string
+	for start := 0; start < len(merged); start += MaxStyleTriples {
+		end := start + MaxStyleTriples
+		if end > len(merged) {
+			end = len(merged)
+		}
+		batch := merged[start:end]
+
+		var b strings.Builder
+		fmt.Fprintf(&b, "style %d %d %d", batch[0].styleIdx, batch[0].start, batch[0].length)
+		for _, tok := range batch[1:] {
+			fmt.Fprintf(&b, " %d %d %d", tok.styleIdx, tok.start, tok.length)
+		}
+		cmds = append(cmds, b.String())
+	}
+	return cmds
 }
 
 // ApplySemanticTokens fetches semantic tokens for the named document from the
@@ -268,14 +278,19 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 		return fmt.Errorf("reading body: %v", err)
 	}
 
-	cmd := buildStyleCmd(result.Data, legend, sm, body)
+	cmds := buildStyleCmds(result.Data, legend, sm, body)
 
-	// Clear existing highlights first, then apply the new ones.
+	// Clear existing highlights first, then apply the new ones in batches.
+	// Each batch is a separate ctl write so ctlstyleparse's fixed 256-triple
+	// buffer is never exceeded.  The occlusion check in ctlstyleparse skips
+	// winframesync for batches whose segments are entirely off-screen.
 	if err := w.Ctl("style 0"); err != nil {
 		return err
 	}
-	if cmd == "" {
-		return nil // no mapped tokens; clear was enough
+	for _, cmd := range cmds {
+		if err := w.Ctl("%s", cmd); err != nil {
+			return err
+		}
 	}
-	return w.Ctl("%s", cmd)
+	return nil
 }
