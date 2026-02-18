@@ -73,22 +73,26 @@ func semanticLegend(caps protocol.ServerCapabilities) (*protocol.SemanticTokensL
 // runeOffsets maps line numbers to rune offsets for translating LSP
 // (line, character) positions into acme rune offsets.
 type runeOffsets struct {
-	lineStart []int // lineStart[i] = rune offset of first rune on line i
-	total     int
+	lineStart     []int // lineStart[i] = rune offset of first rune on line i
+	lineStartByte []int // lineStartByte[i] = byte offset of first byte on line i
+	total         int
 }
 
 func buildRuneOffsets(body []byte) *runeOffsets {
 	starts := []int{0}
-	n := 0
+	startBytes := []int{0}
+	n, nb := 0, 0
 	for len(body) > 0 {
 		r, sz := utf8.DecodeRune(body)
 		body = body[sz:]
 		n++
+		nb += sz
 		if r == '\n' {
 			starts = append(starts, n)
+			startBytes = append(startBytes, nb)
 		}
 	}
-	return &runeOffsets{lineStart: starts, total: n}
+	return &runeOffsets{lineStart: starts, lineStartByte: startBytes, total: n}
 }
 
 func (ro *runeOffsets) toRuneOffset(line, col int) int {
@@ -102,6 +106,43 @@ func (ro *runeOffsets) toRuneOffset(line, col int) int {
 	return o
 }
 
+// blankLinesOnly returns true if every rune in body[gapStart:gapEnd] (rune
+// offsets) is a newline — i.e. the gap consists only of blank lines.
+func blankLinesOnly(body []byte, ro *runeOffsets, gapStart, gapEnd int) bool {
+	if gapEnd <= gapStart {
+		return true
+	}
+	// Locate the byte offset of gapStart via the line table.
+	// lineStart[i] and lineStartByte[i] give us anchor points.
+	// Find the line whose lineStart is <= gapStart.
+	byteOff := 0
+	for l := len(ro.lineStart) - 1; l >= 0; l-- {
+		if ro.lineStart[l] <= gapStart {
+			byteOff = ro.lineStartByte[l]
+			// Advance byte-wise for any runes between lineStart[l] and gapStart.
+			skip := gapStart - ro.lineStart[l]
+			b := body[byteOff:]
+			for skip > 0 {
+				_, sz := utf8.DecodeRune(b)
+				b = b[sz:]
+				byteOff += sz
+				skip--
+			}
+			break
+		}
+	}
+	// Walk runes from gapStart to gapEnd checking each is '\n'.
+	b := body[byteOff:]
+	for i := gapStart; i < gapEnd && len(b) > 0; i++ {
+		r, sz := utf8.DecodeRune(b)
+		b = b[sz:]
+		if r != '\n' {
+			return false
+		}
+	}
+	return true
+}
+
 // buildStyleCmd converts the encoded LSP semantic token data into an acme
 // style ctl command.
 //
@@ -111,13 +152,19 @@ func (ro *runeOffsets) toRuneOffset(line, col int) int {
 //
 // Every entry carries an absolute start position so non-contiguous ranges
 // require no gap-filling.  Returns "" if there are no mapped tokens.
+// styleToken holds a resolved token ready for emission.
+type styleToken struct {
+	styleIdx int
+	start    int // rune offset
+	length   int // runes
+}
+
 func buildStyleCmd(data []uint32, legend *protocol.SemanticTokensLegend, sm StyleMap, body []byte) string {
 	ro := buildRuneOffsets(body)
 
-	var b bytes.Buffer
-	first := true
+	// First pass: decode the relative encoding into absolute tokens.
+	tokens := make([]styleToken, 0, len(data)/5)
 	var line, col uint32
-
 	for i := 0; i+4 < len(data); i += 5 {
 		deltaLine := data[i]
 		deltaCol := data[i+1]
@@ -139,16 +186,52 @@ func buildStyleCmd(data []uint32, legend *protocol.SemanticTokensLegend, sm Styl
 		if !ok || styleIdx == 0 {
 			continue // unmapped or default style — skip
 		}
+		tokens = append(tokens, styleToken{
+			styleIdx: styleIdx,
+			start:    ro.toRuneOffset(int(line), int(col)),
+			// LSP encodes length in UTF-16 code units; we approximate with rune
+			// count, which is exact for BMP content (the common case).
+			length: int(length),
+		})
+	}
 
-		start := ro.toRuneOffset(int(line), int(col))
-		// LSP encodes length in UTF-16 code units; we approximate with rune count,
-		// which is exact for BMP content (the common case for source code).
-		if first {
-			fmt.Fprintf(&b, "style %d %d %d", styleIdx, start, int(length))
-			first = false
+	// Second pass: emit tokens, merging adjacent runs of the same style that
+	// are separated only by blank lines.  gopls returns one token per line for
+	// multi-line constructs (e.g. backtick strings, block comments) and emits
+	// nothing for blank lines within them, even when multilineTokenSupport is
+	// advertised.  We fill those gaps so the blank lines stay styled.
+	var b bytes.Buffer
+	emit := func(idx, start, length int) {
+		if b.Len() == 0 {
+			fmt.Fprintf(&b, "style %d %d %d", idx, start, length)
 		} else {
-			fmt.Fprintf(&b, " %d %d %d", styleIdx, start, int(length))
+			fmt.Fprintf(&b, " %d %d %d", idx, start, length)
 		}
+	}
+
+	for i := 0; i < len(tokens); i++ {
+		t := tokens[i]
+		start := t.start
+		end := t.start + t.length
+
+		// Absorb any following tokens of the same style where the only gap
+		// between them consists of blank lines.  gopls returns one token per
+		// line for multi-line constructs and emits nothing for blank lines,
+		// even with multilineTokenSupport advertised.
+		for j := i + 1; j < len(tokens); j++ {
+			next := tokens[j]
+			if next.styleIdx != t.styleIdx {
+				break
+			}
+			if !blankLinesOnly(body, ro, end, next.start) {
+				break
+			}
+			// Gap is blank-lines only — extend to cover it.
+			end = next.start + next.length
+			i = j
+		}
+
+		emit(t.styleIdx, start, end-start)
 	}
 	return b.String()
 }
