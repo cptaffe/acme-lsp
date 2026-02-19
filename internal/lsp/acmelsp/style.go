@@ -13,6 +13,8 @@ import (
 	"9fans.net/acme-lsp/internal/acmeutil"
 	"9fans.net/acme-lsp/internal/lsp/text"
 	"9fans.net/internal/go-lsp/lsp/protocol"
+	"github.com/fhs/9fans-go/plan9"
+	"github.com/fhs/9fans-go/plan9/client"
 )
 
 // StyleMap maps semantic token type name to a style index as defined in
@@ -150,40 +152,73 @@ func blankLinesOnly(body []byte, ro *runeOffsets, gapStart, gapEnd int) bool {
 	return true
 }
 
-// MaxStyleTriples is the maximum number of (index, start, length) triples
-// that fit in a single style ctl write.  ctlstyleparse in acme declares a
-// fixed buffer of 768 ulongs, which holds exactly 256 triples.
-const MaxStyleTriples = 256
-
-// styleToken holds a resolved token ready for emission.
-type styleToken struct {
-	styleIdx int
-	start    int // rune offset
-	length   int // runes
+// StyleEntry is a resolved (style-index, start-rune-offset, rune-length)
+// triple ready for writing to an acme-styles layer.
+type StyleEntry struct {
+	StyleIdx int
+	Start    int
+	Length   int
 }
 
-// buildStyleCmds converts the encoded LSP semantic token data into one or
-// more acme style ctl commands, each containing at most MaxStyleTriples
-// triples so that ctlstyleparse never overflows its fixed buffer.
-//
-// The acme style command format used here is:
-//
-//	style <idx> <start> <len> [<idx> <start> <len> ...]
-//
-// Every entry carries an absolute start position so non-contiguous ranges
-// require no gap-filling.  Returns nil if there are no mapped tokens.
-func buildStyleCmds(data []uint32, legend *protocol.SemanticTokensLegend, sm StyleMap, body []byte) []string {
+// StyleLayer represents a single named layer owned by acme-lsp on the
+// acme-styles compositor for one acme window.
+type StyleLayer struct {
+	fs      *client.Fsys
+	winID   int
+	layerID int
+}
+
+// Clear opens the layer's clear file (which zeroes all entries on open).
+func (sl *StyleLayer) Clear() error {
+	fid, err := sl.fs.Open(fmt.Sprintf("%d/layers/%d/clear", sl.winID, sl.layerID), plan9.OWRITE)
+	if err != nil {
+		return err
+	}
+	return fid.Close()
+}
+
+// Write sends a slice of style entries to the layer's style file.
+// Each entry is written as "styleIdx start length\n".
+func (sl *StyleLayer) Write(entries []StyleEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	fid, err := sl.fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.winID, sl.layerID), plan9.OWRITE)
+	if err != nil {
+		return err
+	}
+	defer fid.Close()
+	var sb strings.Builder
+	for _, e := range entries {
+		fmt.Fprintf(&sb, "%d %d %d\n", e.StyleIdx, e.Start, e.Length)
+	}
+	_, err = fid.Write([]byte(sb.String()))
+	return err
+}
+
+// Apply clears the layer then writes all entries.
+func (sl *StyleLayer) Apply(entries []StyleEntry) error {
+	if err := sl.Clear(); err != nil {
+		return err
+	}
+	return sl.Write(entries)
+}
+
+// buildStyleEntries converts encoded LSP semantic token data into a flat slice
+// of StyleEntry values ready for writing to an acme-styles layer.
+// Returns nil if there are no mapped tokens.
+func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, sm StyleMap, body []byte) []StyleEntry {
 	ro := buildRuneOffsets(body)
 
-	// First pass: decode the relative encoding into absolute tokens.
-	tokens := make([]styleToken, 0, len(data)/5)
+	// First pass: decode the relative encoding into absolute entries.
+	entries := make([]StyleEntry, 0, len(data)/5)
 	var line, col uint32
 	for i := 0; i+4 < len(data); i += 5 {
 		deltaLine := data[i]
 		deltaCol := data[i+1]
 		length := data[i+2]
 		tokenType := data[i+3]
-		// data[i+4] = tokenModifiers (unused for now)
+		// data[i+4] = tokenModifiers (unused)
 
 		if deltaLine != 0 {
 			line += deltaLine
@@ -197,14 +232,12 @@ func buildStyleCmds(data []uint32, legend *protocol.SemanticTokensLegend, sm Sty
 		}
 		styleIdx, ok := sm[legend.TokenTypes[tokenType]]
 		if !ok || styleIdx == 0 {
-			continue // unmapped or default style — skip
+			continue
 		}
-		tokens = append(tokens, styleToken{
-			styleIdx: styleIdx,
-			start:    ro.toRuneOffset(int(line), int(col)),
-			// LSP encodes length in UTF-16 code units; we approximate with rune
-			// count, which is exact for BMP content (the common case).
-			length: int(length),
+		entries = append(entries, StyleEntry{
+			StyleIdx: styleIdx,
+			Start:    ro.toRuneOffset(int(line), int(col)),
+			Length:   int(length),
 		})
 	}
 
@@ -212,46 +245,25 @@ func buildStyleCmds(data []uint32, legend *protocol.SemanticTokensLegend, sm Sty
 	// blank lines.  gopls returns one token per line for multi-line constructs
 	// (backtick strings, block comments) and emits nothing for blank lines
 	// within them, even when multilineTokenSupport is advertised.
-	merged := make([]styleToken, 0, len(tokens))
-	for i := 0; i < len(tokens); i++ {
-		t := tokens[i]
-		end := t.start + t.length
-		for j := i + 1; j < len(tokens); j++ {
-			next := tokens[j]
-			if next.styleIdx != t.styleIdx {
+	merged := make([]StyleEntry, 0, len(entries))
+	for i := 0; i < len(entries); i++ {
+		e := entries[i]
+		end := e.Start + e.Length
+		for j := i + 1; j < len(entries); j++ {
+			next := entries[j]
+			if next.StyleIdx != e.StyleIdx {
 				break
 			}
-			if !blankLinesOnly(body, ro, end, next.start) {
+			if !blankLinesOnly(body, ro, end, next.Start) {
 				break
 			}
-			end = next.start + next.length
+			end = next.Start + next.Length
 			i = j
 		}
-		merged = append(merged, styleToken{t.styleIdx, t.start, end - t.start})
+		merged = append(merged, StyleEntry{e.StyleIdx, e.Start, end - e.Start})
 	}
 
-	if len(merged) == 0 {
-		return nil
-	}
-
-	// Third pass: split merged tokens into batches of at most MaxStyleTriples
-	// so each ctl write fits within ctlstyleparse's fixed buffer.
-	var cmds []string
-	for start := 0; start < len(merged); start += MaxStyleTriples {
-		end := start + MaxStyleTriples
-		if end > len(merged) {
-			end = len(merged)
-		}
-		batch := merged[start:end]
-
-		var b strings.Builder
-		fmt.Fprintf(&b, "style %d %d %d", batch[0].styleIdx, batch[0].start, batch[0].length)
-		for _, tok := range batch[1:] {
-			fmt.Fprintf(&b, " %d %d %d", tok.styleIdx, tok.start, tok.length)
-		}
-		cmds = append(cmds, b.String())
-	}
-	return cmds
+	return merged
 }
 
 // applyTokenEdits applies a slice of LSP SemanticTokensEdit operations to the
@@ -280,16 +292,13 @@ func applyTokenEdits(prev []uint32, edits []protocol.SemanticTokensEdit) []uint3
 }
 
 // ApplySemanticTokens fetches semantic tokens for the named document from the
-// LSP server and writes the corresponding style ctl commands to the acme window.
+// LSP server and writes them to layer via the acme-styles compositor.
 //
-// ts is the per-file token cache.  When ts holds a non-empty resultID from a
-// previous response the function requests a delta update
-// (textDocument/semanticTokens/full/delta) and applies the edit list to the
-// cached data; this is more efficient than a full request for large files.
-// A full request is used when ts is nil, when no resultID is cached, or when
-// the delta request fails.
-func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name string, sm StyleMap, ts *tokenState) error {
-	if len(sm) == 0 {
+// ts is the per-file token cache.  When ts holds a non-empty resultID the
+// function uses the LSP delta protocol (textDocument/semanticTokens/full/delta)
+// for efficiency; a full request is used on first call or after failure.
+func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name string, sm StyleMap, ts *tokenState, layer *StyleLayer) error {
+	if len(sm) == 0 || layer == nil {
 		return nil
 	}
 	legend, ok := semanticLegend(c.initializeResult.Capabilities)
@@ -302,7 +311,6 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 		return fmt.Errorf("reading body: %v", err)
 	}
 
-	// Retrieve cached state under the token-state lock.
 	var prevResultID string
 	var prevData []uint32
 	if ts != nil {
@@ -316,15 +324,12 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 	var newResultID string
 
 	if prevResultID != "" {
-		// Attempt a delta request using the previous resultId.
 		raw, err := c.SemanticTokensFullDelta(ctx, &protocol.SemanticTokensDeltaParams{
 			TextDocument:     protocol.TextDocumentIdentifier{URI: text.ToURI(name)},
 			PreviousResultID: prevResultID,
 		})
 		if err == nil && raw != nil {
 			b, _ := json.Marshal(raw)
-			// Distinguish a SemanticTokensDelta (has "edits") from a SemanticTokens
-			// (has "data") by checking which key is present.
 			var peek struct {
 				Edits *json.RawMessage `json:"edits"`
 			}
@@ -346,7 +351,6 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 	}
 
 	if data == nil {
-		// Fall back to a full token request.
 		result, err := c.SemanticTokensFull(ctx, &protocol.SemanticTokensParams{
 			TextDocument: protocol.TextDocumentIdentifier{URI: text.ToURI(name)},
 		})
@@ -357,13 +361,12 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 			return nil // non-fatal: server may not be ready yet
 		}
 		if result == nil || len(result.Data) == 0 {
-			return w.Ctl("style 0")
+			return layer.Clear()
 		}
 		data = result.Data
 		newResultID = result.ResultID
 	}
 
-	// Persist the updated result for the next delta request.
 	if ts != nil && newResultID != "" {
 		ts.mu.Lock()
 		ts.resultID = newResultID
@@ -371,19 +374,5 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 		ts.mu.Unlock()
 	}
 
-	cmds := buildStyleCmds(data, legend, sm, body)
-
-	// Clear existing highlights first, then apply the new ones in batches.
-	// Each batch is a separate ctl write so ctlstyleparse's fixed 256-triple
-	// buffer is never exceeded.  The occlusion check in ctlstyleparse skips
-	// winframesync for batches whose segments are entirely off-screen.
-	if err := w.Ctl("style 0"); err != nil {
-		return err
-	}
-	for _, cmd := range cmds {
-		if err := w.Ctl("%s", cmd); err != nil {
-			return err
-		}
-	}
-	return nil
+	return layer.Apply(buildStyleEntries(data, legend, sm, body))
 }

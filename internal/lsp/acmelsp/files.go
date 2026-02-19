@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +16,8 @@ import (
 	"9fans.net/acme-lsp/internal/lsp/acmelsp/config"
 	"9fans.net/acme-lsp/internal/lsp/text"
 	"9fans.net/internal/go-lsp/lsp/protocol"
+	"github.com/fhs/9fans-go/plan9"
+	"github.com/fhs/9fans-go/plan9/client"
 )
 
 // tokenState caches the last semantic-token response for a file so that
@@ -27,22 +31,18 @@ type tokenState struct {
 // FileManager keeps track of open files in acme.
 // It is used to synchronize text with LSP server.
 //
-// FileManager keeps track of open files in acme.
-// It is used to synchronize text with LSP server.
-//
-// styleWins holds a persistent *acmeutil.Win per tracked file.  Keeping ctl
-// open gives every applyStyles call the same style layer, so stale layers
-// from earlier token updates cannot accumulate.  This used to be impossible
-// because an open ctl fd blocked the "del" log event; acme now fires the del
-// event at window-removal time and returns an error on subsequent ctl writes,
-// so a persistent ctl fd is safe.
+// When the acme-styles compositor is available, FileManager allocates a named
+// layer for each tracked window and routes all semantic-token highlights
+// through that layer, keeping acme-lsp's highlights separate from other
+// styling tools.
 type FileManager struct {
 	ss          *ServerSet
-	wins        map[string]struct{}     // set of open files
-	styleWins   map[string]*acmeutil.Win // persistent Win per file, for style layer ownership
+	wins        map[string]struct{}     // set of open files (by name)
+	styleFS     *client.Fsys            // connection to acme-styles; nil if unavailable
+	styleLayers map[int]*StyleLayer     // winID → layer; keyed by ID so tag-line renames don't break lookups
 	mu          sync.Mutex
-	styles      StyleMap            // name→index from acme style file; nil if not configured
-	tokenStates map[string]*tokenState // cached token state per file; access protected by mu
+	styles      StyleMap                // name→index from acme style file; nil if not configured
+	tokenStates map[string]*tokenState  // cached token state per file; access protected by mu
 	watchers    map[string]chan struct{} // stop channels for per-window body watchers; access protected by mu
 
 	cfg *config.Config
@@ -53,7 +53,7 @@ func NewFileManager(ss *ServerSet, cfg *config.Config) (*FileManager, error) {
 	fm := &FileManager{
 		ss:          ss,
 		wins:        make(map[string]struct{}),
-		styleWins:   make(map[string]*acmeutil.Win),
+		styleLayers: make(map[int]*StyleLayer),
 		tokenStates: make(map[string]*tokenState),
 		watchers:    make(map[string]chan struct{}),
 		cfg:         cfg,
@@ -66,6 +66,12 @@ func NewFileManager(ss *ServerSet, cfg *config.Config) (*FileManager, error) {
 		} else {
 			fm.styles = sm
 			ss.tokensRefresher = fm
+			// Connect to the acme-styles compositor.
+			if fs, err := client.MountService("acme-styles"); err != nil {
+				log.Printf("acme-lsp: connecting to acme-styles: %v (styling disabled)", err)
+			} else {
+				fm.styleFS = fs
+			}
 		}
 	}
 
@@ -104,7 +110,7 @@ func (fm *FileManager) Run() {
 				log.Printf("didOpen failed in file manager: %v", err)
 			}
 		case "del":
-			if err := fm.didClose(ev.Name); err != nil {
+			if err := fm.didClose(ev.ID, ev.Name); err != nil {
 				log.Printf("didClose failed in file manager: %v", err)
 			}
 		case "get":
@@ -168,16 +174,18 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 		return err
 	}
 
-	// If styling is active, open a persistent Win so that all style ctl
-	// commands for this window share one ctl fid — and thus one style layer.
-	// Acme now logs "del" at window-removal time regardless of open fids, so
-	// keeping ctl open no longer delays the event.
+	// If styling is active and acme-styles is available, allocate a layer for
+	// this window so that acme-lsp's highlights are composited independently
+	// of other styling tools.
 	if len(fm.styles) > 0 && winid >= 0 {
-		sw, err := acmeutil.OpenWin(winid)
-		if err == nil {
-			fm.mu.Lock()
-			fm.styleWins[name] = sw
-			fm.mu.Unlock()
+		if fm.styleFS != nil {
+			if layer, err := fm.newStyleLayer(winid); err != nil {
+				log.Printf("acme-lsp: allocating style layer for window %d (%v): %v", winid, name, err)
+			} else {
+				fm.mu.Lock()
+				fm.styleLayers[winid] = layer
+				fm.mu.Unlock()
+			}
 		}
 		stop := make(chan struct{})
 		fm.mu.Lock()
@@ -188,6 +196,27 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 
 	fm.applyStyles(winid, name)
 	return nil
+}
+
+// newStyleLayer allocates a fresh layer for the given acme window on the
+// acme-styles compositor.  It opens <winid>/layers/new, reads back the
+// assigned layer ID, and returns a ready-to-use StyleLayer.
+func (fm *FileManager) newStyleLayer(winid int) (*StyleLayer, error) {
+	fid, err := fm.styleFS.Open(fmt.Sprintf("%d/layers/new", winid), plan9.OREAD)
+	if err != nil {
+		return nil, err
+	}
+	var buf [32]byte
+	n, err := fid.Read(buf[:])
+	fid.Close()
+	if err != nil && n == 0 {
+		return nil, fmt.Errorf("reading layer id: %v", err)
+	}
+	layerID, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
+	if err != nil {
+		return nil, fmt.Errorf("parsing layer id %q: %v", string(buf[:n]), err)
+	}
+	return &StyleLayer{fs: fm.styleFS, winID: winid, layerID: layerID}, nil
 }
 
 // watchBody polls the body of window winid every 300 ms.  When the content
@@ -259,36 +288,23 @@ func (fm *FileManager) notifyDidChange(name string, body []byte) {
 }
 
 // applyStyles fetches semantic tokens for the named window and applies the
-// corresponding style ctl commands.  It runs in its own goroutine so as not
-// to block the file-manager event loop.
+// corresponding highlights via the acme-styles layer.  Runs in its own
+// goroutine so as not to block the file-manager event loop.
 func (fm *FileManager) applyStyles(winid int, name string) {
 	if len(fm.styles) == 0 {
 		return
 	}
 	fm.mu.Lock()
 	ts := fm.tokenStates[name]
-	sw := fm.styleWins[name] // persistent Win that owns our style layer; may be nil
+	layer := fm.styleLayers[winid] // nil if acme-styles unavailable
 	fm.mu.Unlock()
 
 	go func() {
-		var err error
-		if sw != nil {
-			// Use the persistent Win so all style ctl writes share one fid
-			// (and therefore one style layer).  If the window has been deleted,
-			// the ctl write will return "window deleted"; treat that as a clean
-			// close and let the next del log event handle cleanup.
-			err = fm.withClient(winid, name, func(c *Client, _ *acmeutil.Win) error {
-				return ApplySemanticTokens(context.Background(), c, sw, name, fm.styles, ts)
-			})
-		} else {
-			err = fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
-				return ApplySemanticTokens(context.Background(), c, w, name, fm.styles, ts)
-			})
-		}
-		if err != nil {
-			if Verbose {
-				log.Printf("applyStyles %v: %v", name, err)
-			}
+		err := fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
+			return ApplySemanticTokens(context.Background(), c, w, name, fm.styles, ts, layer)
+		})
+		if err != nil && Verbose {
+			log.Printf("applyStyles %v: %v", name, err)
 		}
 	}()
 }
@@ -321,7 +337,7 @@ func (fm *FileManager) RefreshSemanticTokens() {
 	}
 }
 
-func (fm *FileManager) didClose(name string) error {
+func (fm *FileManager) didClose(winid int, name string) error {
 	fm.mu.Lock()
 
 	// Stop the body watcher if one is running for this file.
@@ -331,10 +347,11 @@ func (fm *FileManager) didClose(name string) error {
 	}
 	delete(fm.tokenStates, name)
 
-	// Release the persistent style Win (closes the ctl fid, freeing the style layer).
-	if sw, ok := fm.styleWins[name]; ok {
-		sw.CloseFiles()
-		delete(fm.styleWins, name)
+	// Clear the acme-styles layer so highlights don't linger after close.
+	// Keyed by winID, not name, so tag-line renames don't orphan the entry.
+	if layer, ok := fm.styleLayers[winid]; ok {
+		layer.Clear() //nolint:errcheck
+		delete(fm.styleLayers, winid)
 	}
 
 	if _, ok := fm.wins[name]; !ok {
