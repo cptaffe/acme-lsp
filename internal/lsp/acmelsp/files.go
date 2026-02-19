@@ -5,8 +5,6 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -16,7 +14,6 @@ import (
 	"9fans.net/acme-lsp/internal/lsp/acmelsp/config"
 	"9fans.net/acme-lsp/internal/lsp/text"
 	"9fans.net/internal/go-lsp/lsp/protocol"
-	"9fans.net/go/plan9"
 	"9fans.net/go/plan9/client"
 )
 
@@ -38,7 +35,6 @@ type tokenState struct {
 type FileManager struct {
 	ss          *ServerSet
 	wins        map[string]struct{}     // set of open files (by name)
-	styleFS     *client.Fsys            // connection to acme-styles; nil if unavailable
 	styleLayers map[int]*StyleLayer     // winID → layer; keyed by ID so tag-line renames don't break lookups
 	mu          sync.Mutex
 	styles      StyleMap                // name→index from acme style file; nil if not configured
@@ -66,12 +62,6 @@ func NewFileManager(ss *ServerSet, cfg *config.Config) (*FileManager, error) {
 		} else {
 			fm.styles = sm
 			ss.tokensRefresher = fm
-			// Connect to the acme-styles compositor.
-			if fs, err := client.MountService("acme-styles"); err != nil {
-				log.Printf("acme-lsp: connecting to acme-styles: %v (styling disabled)", err)
-			} else {
-				fm.styleFS = fs
-			}
 		}
 	}
 
@@ -174,18 +164,17 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 		return err
 	}
 
-	// If styling is active and acme-styles is available, allocate a layer for
-	// this window so that acme-lsp's highlights are composited independently
-	// of other styling tools.
+	// If styling is active, allocate a layer for this window so that
+	// acme-lsp's highlights are composited independently of other tools.
+	// newStyleLayer mounts acme-styles fresh each time, so it survives
+	// acme-styles restarts without a persistent connection in FileManager.
 	if len(fm.styles) > 0 && winid >= 0 {
-		if fm.styleFS != nil {
-			if layer, err := fm.newStyleLayer(winid); err != nil {
-				log.Printf("acme-lsp: allocating style layer for window %d (%v): %v", winid, name, err)
-			} else {
-				fm.mu.Lock()
-				fm.styleLayers[winid] = layer
-				fm.mu.Unlock()
-			}
+		if layer, err := fm.newStyleLayer(winid); err != nil {
+			log.Printf("acme-lsp: allocating style layer for window %d (%v): %v", winid, name, err)
+		} else {
+			fm.mu.Lock()
+			fm.styleLayers[winid] = layer
+			fm.mu.Unlock()
 		}
 		stop := make(chan struct{})
 		fm.mu.Lock()
@@ -199,24 +188,21 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 }
 
 // newStyleLayer allocates a fresh layer for the given acme window on the
-// acme-styles compositor.  It opens <winid>/layers/new, reads back the
-// assigned layer ID, and returns a ready-to-use StyleLayer.
+// acme-styles compositor.  A new connection to acme-styles is opened and
+// closed for the allocation; the returned StyleLayer holds no persistent
+// connection so it is resilient to acme-styles restarts.
 func (fm *FileManager) newStyleLayer(winid int) (*StyleLayer, error) {
-	fid, err := fm.styleFS.Open(fmt.Sprintf("%d/layers/new", winid), plan9.OREAD)
+	fs, err := client.MountService("acme-styles")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("acme-styles: %v", err)
 	}
-	var buf [32]byte
-	n, err := fid.Read(buf[:])
-	fid.Close()
-	if err != nil && n == 0 {
-		return nil, fmt.Errorf("reading layer id: %v", err)
+	defer fs.Close()
+
+	sl := &StyleLayer{winID: winid}
+	if err := sl.allocLayer(fs); err != nil {
+		return nil, fmt.Errorf("alloc layer for win %d: %v", winid, err)
 	}
-	layerID, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
-	if err != nil {
-		return nil, fmt.Errorf("parsing layer id %q: %v", string(buf[:n]), err)
-	}
-	return &StyleLayer{fs: fm.styleFS, winID: winid, layerID: layerID}, nil
+	return sl, nil
 }
 
 // watchBody polls the body of window winid every 300 ms.  When the content

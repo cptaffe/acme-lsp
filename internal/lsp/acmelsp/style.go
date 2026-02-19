@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -161,29 +162,82 @@ type StyleEntry struct {
 }
 
 // StyleLayer represents a single named layer owned by acme-lsp on the
-// acme-styles compositor for one acme window.
+// acme-styles compositor for one acme window.  It holds no persistent
+// connection — each operation mounts acme-styles fresh so the layer
+// survives acme-styles restarts transparently.
 type StyleLayer struct {
-	fs      *client.Fsys
 	winID   int
 	layerID int
 }
 
-// Clear opens the layer's clear file (which zeroes all entries on open).
-func (sl *StyleLayer) Clear() error {
-	fid, err := sl.fs.Open(fmt.Sprintf("%d/layers/%d/clear", sl.winID, sl.layerID), plan9.OWRITE)
+func (sl *StyleLayer) mount() (*client.Fsys, error) {
+	return client.MountService("acme-styles")
+}
+
+// allocLayer opens <winid>/layers/new and reads back the assigned ID,
+// updating sl.layerID in place.
+func (sl *StyleLayer) allocLayer(fs *client.Fsys) error {
+	fid, err := fs.Open(fmt.Sprintf("%d/layers/new", sl.winID), plan9.OREAD)
 	if err != nil {
 		return err
 	}
-	return fid.Close()
+	var buf [32]byte
+	n, err := fid.Read(buf[:])
+	fid.Close()
+	if err != nil && n == 0 {
+		return fmt.Errorf("reading layer id: %v", err)
+	}
+	id, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
+	if err != nil {
+		return fmt.Errorf("parsing layer id %q: %v", string(buf[:n]), err)
+	}
+	sl.layerID = id
+	return nil
 }
 
-// Write sends a slice of style entries to the layer's style file.
-// Each entry is written as "styleIdx start length\n".
-func (sl *StyleLayer) Write(entries []StyleEntry) error {
+// Clear zeroes the layer.  Best-effort: if acme-styles is not running the
+// layer is already gone, so errors are silently ignored.
+func (sl *StyleLayer) Clear() error {
+	fs, err := sl.mount()
+	if err != nil {
+		return nil
+	}
+	defer fs.Close()
+	fid, err := fs.Open(fmt.Sprintf("%d/layers/%d/clear", sl.winID, sl.layerID), plan9.OWRITE)
+	if err != nil {
+		return nil
+	}
+	fid.Close()
+	return nil
+}
+
+// Apply clears the layer and writes new entries.  If the layer no longer
+// exists (acme-styles restarted) it is re-allocated before writing.
+func (sl *StyleLayer) Apply(entries []StyleEntry) error {
+	fs, err := sl.mount()
+	if err != nil {
+		return err
+	}
+	defer fs.Close()
+
+	clearPath := fmt.Sprintf("%d/layers/%d/clear", sl.winID, sl.layerID)
+	clearFid, err := fs.Open(clearPath, plan9.OWRITE)
+	if err != nil {
+		// Layer is gone — acme-styles restarted.  Re-allocate and retry.
+		if err2 := sl.allocLayer(fs); err2 != nil {
+			return fmt.Errorf("clear: %v; re-alloc: %v", err, err2)
+		}
+		clearFid, err = fs.Open(fmt.Sprintf("%d/layers/%d/clear", sl.winID, sl.layerID), plan9.OWRITE)
+		if err != nil {
+			return err
+		}
+	}
+	clearFid.Close()
+
 	if len(entries) == 0 {
 		return nil
 	}
-	fid, err := sl.fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.winID, sl.layerID), plan9.OWRITE)
+	fid, err := fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.winID, sl.layerID), plan9.OWRITE)
 	if err != nil {
 		return err
 	}
@@ -194,14 +248,6 @@ func (sl *StyleLayer) Write(entries []StyleEntry) error {
 	}
 	_, err = fid.Write([]byte(sb.String()))
 	return err
-}
-
-// Apply clears the layer then writes all entries.
-func (sl *StyleLayer) Apply(entries []StyleEntry) error {
-	if err := sl.Clear(); err != nil {
-		return err
-	}
-	return sl.Write(entries)
 }
 
 // buildStyleEntries converts encoded LSP semantic token data into a flat slice
