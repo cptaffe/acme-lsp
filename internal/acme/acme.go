@@ -321,13 +321,13 @@ func (w *Win) fid(name string) (*client.Fid, error) {
 	return *f, nil
 }
 
-// ReadAll
+// ReadAll reads all data from the named window file.
 func (w *Win) ReadAll(file string) ([]byte, error) {
 	f, err := w.fid(file)
-	f.Seek(0, 0)
 	if err != nil {
 		return nil, err
 	}
+	f.Seek(0, 0)
 	return ioutil.ReadAll(f)
 }
 
