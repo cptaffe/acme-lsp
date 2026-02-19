@@ -9,3 +9,5 @@ require (
 	github.com/google/go-cmp v0.3.0
 	github.com/sourcegraph/jsonrpc2 v0.2.0
 )
+
+require 9fans.net/go v0.0.7 // indirect
