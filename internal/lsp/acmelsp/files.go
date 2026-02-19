@@ -27,12 +27,19 @@ type tokenState struct {
 // FileManager keeps track of open files in acme.
 // It is used to synchronize text with LSP server.
 //
-// Note that we can't cache the *acmeutil.Win for the windows
-// because having the ctl file open prevents del event from
-// being delivered to acme/log file.
+// FileManager keeps track of open files in acme.
+// It is used to synchronize text with LSP server.
+//
+// styleWins holds a persistent *acmeutil.Win per tracked file.  Keeping ctl
+// open gives every applyStyles call the same style layer, so stale layers
+// from earlier token updates cannot accumulate.  This used to be impossible
+// because an open ctl fd blocked the "del" log event; acme now fires the del
+// event at window-removal time and returns an error on subsequent ctl writes,
+// so a persistent ctl fd is safe.
 type FileManager struct {
 	ss          *ServerSet
-	wins        map[string]struct{} // set of open files
+	wins        map[string]struct{}     // set of open files
+	styleWins   map[string]*acmeutil.Win // persistent Win per file, for style layer ownership
 	mu          sync.Mutex
 	styles      StyleMap            // name→index from acme style file; nil if not configured
 	tokenStates map[string]*tokenState // cached token state per file; access protected by mu
@@ -46,6 +53,7 @@ func NewFileManager(ss *ServerSet, cfg *config.Config) (*FileManager, error) {
 	fm := &FileManager{
 		ss:          ss,
 		wins:        make(map[string]struct{}),
+		styleWins:   make(map[string]*acmeutil.Win),
 		tokenStates: make(map[string]*tokenState),
 		watchers:    make(map[string]chan struct{}),
 		cfg:         cfg,
@@ -160,8 +168,17 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 		return err
 	}
 
-	// Start a background watcher so edits trigger style updates without a save.
-	if len(fm.styles) > 0 {
+	// If styling is active, open a persistent Win so that all style ctl
+	// commands for this window share one ctl fid — and thus one style layer.
+	// Acme now logs "del" at window-removal time regardless of open fids, so
+	// keeping ctl open no longer delays the event.
+	if len(fm.styles) > 0 && winid >= 0 {
+		sw, err := acmeutil.OpenWin(winid)
+		if err == nil {
+			fm.mu.Lock()
+			fm.styleWins[name] = sw
+			fm.mu.Unlock()
+		}
 		stop := make(chan struct{})
 		fm.mu.Lock()
 		fm.watchers[name] = stop
@@ -250,14 +267,28 @@ func (fm *FileManager) applyStyles(winid int, name string) {
 	}
 	fm.mu.Lock()
 	ts := fm.tokenStates[name]
+	sw := fm.styleWins[name] // persistent Win that owns our style layer; may be nil
 	fm.mu.Unlock()
 
 	go func() {
-		err := fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
-			return ApplySemanticTokens(context.Background(), c, w, name, fm.styles, ts)
-		})
+		var err error
+		if sw != nil {
+			// Use the persistent Win so all style ctl writes share one fid
+			// (and therefore one style layer).  If the window has been deleted,
+			// the ctl write will return "window deleted"; treat that as a clean
+			// close and let the next del log event handle cleanup.
+			err = fm.withClient(winid, name, func(c *Client, _ *acmeutil.Win) error {
+				return ApplySemanticTokens(context.Background(), c, sw, name, fm.styles, ts)
+			})
+		} else {
+			err = fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
+				return ApplySemanticTokens(context.Background(), c, w, name, fm.styles, ts)
+			})
+		}
 		if err != nil {
-			log.Printf("applyStyles %v: %v", name, err)
+			if Verbose {
+				log.Printf("applyStyles %v: %v", name, err)
+			}
 		}
 	}()
 }
@@ -299,6 +330,12 @@ func (fm *FileManager) didClose(name string) error {
 		delete(fm.watchers, name)
 	}
 	delete(fm.tokenStates, name)
+
+	// Release the persistent style Win (closes the ctl fid, freeing the style layer).
+	if sw, ok := fm.styleWins[name]; ok {
+		sw.CloseFiles()
+		delete(fm.styleWins, name)
+	}
 
 	if _, ok := fm.wins[name]; !ok {
 		fm.mu.Unlock()
