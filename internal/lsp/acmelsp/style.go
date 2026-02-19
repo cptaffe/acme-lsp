@@ -211,8 +211,12 @@ func (sl *StyleLayer) Clear() error {
 	return nil
 }
 
-// Apply clears the layer and writes new entries.  If the layer no longer
-// exists (acme-styles restarted) it is re-allocated before writing.
+// Apply writes entries to the layer.  Opening the style file with OWRITE
+// causes acme-styles to clear the layer atomically at open; the combined
+// flush (writeCtl → one winframesync) happens at fid clunk.
+//
+// If the layer no longer exists (acme-styles restarted) it is re-allocated
+// before writing.
 func (sl *StyleLayer) Apply(entries []StyleEntry) error {
 	fs, err := sl.mount()
 	if err != nil {
@@ -220,28 +224,23 @@ func (sl *StyleLayer) Apply(entries []StyleEntry) error {
 	}
 	defer fs.Close()
 
-	clearPath := fmt.Sprintf("%d/layers/%d/clear", sl.winID, sl.layerID)
-	clearFid, err := fs.Open(clearPath, plan9.OWRITE)
+	stylePath := fmt.Sprintf("%d/layers/%d/style", sl.winID, sl.layerID)
+	fid, err := fs.Open(stylePath, plan9.OWRITE)
 	if err != nil {
 		// Layer is gone — acme-styles restarted.  Re-allocate and retry.
 		if err2 := sl.allocLayer(fs); err2 != nil {
-			return fmt.Errorf("clear: %v; re-alloc: %v", err, err2)
+			return fmt.Errorf("open style: %v; re-alloc: %v", err, err2)
 		}
-		clearFid, err = fs.Open(fmt.Sprintf("%d/layers/%d/clear", sl.winID, sl.layerID), plan9.OWRITE)
+		fid, err = fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.winID, sl.layerID), plan9.OWRITE)
 		if err != nil {
 			return err
 		}
 	}
-	clearFid.Close()
+	defer fid.Close()
 
 	if len(entries) == 0 {
-		return nil
+		return nil // clunk alone flushes an empty composition → "style 0"
 	}
-	fid, err := fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.winID, sl.layerID), plan9.OWRITE)
-	if err != nil {
-		return err
-	}
-	defer fid.Close()
 	var sb strings.Builder
 	for _, e := range entries {
 		fmt.Fprintf(&sb, "%d %d %d\n", e.StyleIdx, e.Start, e.Length)
