@@ -153,12 +153,13 @@ func blankLinesOnly(body []byte, ro *runeOffsets, gapStart, gapEnd int) bool {
 	return true
 }
 
-// StyleEntry is a resolved (style-index, start-rune-offset, rune-length)
-// triple ready for writing to an acme-styles layer.
+// StyleEntry is a resolved (style-index, start-rune, end-rune) triple ready
+// for writing to an acme-styles layer or acme's native style file.
+// Start is inclusive, End is exclusive — matching acme's event coordinates.
 type StyleEntry struct {
 	StyleIdx int
 	Start    int
-	Length   int
+	End      int // exclusive
 }
 
 // StyleLayer represents a single named layer owned by acme-lsp on the
@@ -243,7 +244,7 @@ func (sl *StyleLayer) Apply(entries []StyleEntry) error {
 	}
 	var sb strings.Builder
 	for _, e := range entries {
-		fmt.Fprintf(&sb, "%d %d %d\n", e.StyleIdx, e.Start, e.Length)
+		fmt.Fprintf(&sb, "%d %d %d\n", e.StyleIdx, e.Start, e.End)
 	}
 	_, err = fid.Write([]byte(sb.String()))
 	return err
@@ -279,10 +280,11 @@ func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, sm 
 		if !ok || styleIdx == 0 {
 			continue
 		}
+		start := ro.toRuneOffset(int(line), int(col))
 		entries = append(entries, StyleEntry{
 			StyleIdx: styleIdx,
-			Start:    ro.toRuneOffset(int(line), int(col)),
-			Length:   int(length),
+			Start:    start,
+			End:      start + int(length),
 		})
 	}
 
@@ -293,7 +295,7 @@ func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, sm 
 	merged := make([]StyleEntry, 0, len(entries))
 	for i := 0; i < len(entries); i++ {
 		e := entries[i]
-		end := e.Start + e.Length
+		end := e.End
 		for j := i + 1; j < len(entries); j++ {
 			next := entries[j]
 			if next.StyleIdx != e.StyleIdx {
@@ -302,10 +304,10 @@ func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, sm 
 			if !blankLinesOnly(body, ro, end, next.Start) {
 				break
 			}
-			end = next.Start + next.Length
+			end = next.End
 			i = j
 		}
-		merged = append(merged, StyleEntry{e.StyleIdx, e.Start, end - e.Start})
+		merged = append(merged, StyleEntry{StyleIdx: e.StyleIdx, Start: e.Start, End: end})
 	}
 
 	return merged
