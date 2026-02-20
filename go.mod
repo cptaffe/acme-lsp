@@ -10,4 +10,7 @@ require (
 	github.com/sourcegraph/jsonrpc2 v0.2.0
 )
 
-require 9fans.net/go v0.0.7 // indirect
+require (
+	9fans.net/go v0.0.7
+	github.com/cptaffe/acme-styles v0.0.0
+)

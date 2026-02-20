@@ -14,8 +14,12 @@ import (
 	"9fans.net/acme-lsp/internal/lsp/acmelsp/config"
 	"9fans.net/acme-lsp/internal/lsp/text"
 	"9fans.net/internal/go-lsp/lsp/protocol"
-	"9fans.net/go/plan9/client"
+	"github.com/cptaffe/acme-styles/layer"
 )
+
+// layerName is the well-known name under which acme-lsp registers its
+// acme-styles highlight layer for each window.
+const layerName = "lsp"
 
 // tokenState caches the last semantic-token response for a file so that
 // subsequent requests can use the LSP delta protocol.
@@ -35,9 +39,8 @@ type tokenState struct {
 type FileManager struct {
 	ss          *ServerSet
 	wins        map[string]struct{}     // set of open files (by name)
-	styleLayers map[int]*StyleLayer     // winID → layer; keyed by ID so tag-line renames don't break lookups
+	styleLayers map[int]*layer.StyleLayer // winID → layer; keyed by ID so tag-line renames don't break lookups
 	mu          sync.Mutex
-	styles      StyleMap                // name→index from acme style file; nil if not configured
 	tokenStates map[string]*tokenState  // cached token state per file; access protected by mu
 	watchers    map[string]chan struct{} // stop channels for per-window body watchers; access protected by mu
 
@@ -49,20 +52,14 @@ func NewFileManager(ss *ServerSet, cfg *config.Config) (*FileManager, error) {
 	fm := &FileManager{
 		ss:          ss,
 		wins:        make(map[string]struct{}),
-		styleLayers: make(map[int]*StyleLayer),
+		styleLayers: make(map[int]*layer.StyleLayer),
 		tokenStates: make(map[string]*tokenState),
 		watchers:    make(map[string]chan struct{}),
 		cfg:         cfg,
 	}
 
-	if cfg.StyleFile != "" {
-		sm, err := LoadStyleFile(cfg.StyleFile)
-		if err != nil {
-			log.Printf("acme-lsp: loading style file %v: %v", cfg.StyleFile, err)
-		} else {
-			fm.styles = sm
-			ss.tokensRefresher = fm
-		}
+	if cfg.SemanticHighlighting {
+		ss.tokensRefresher = fm
 	}
 
 	wins, err := acme.Windows()
@@ -164,16 +161,16 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 		return err
 	}
 
-	// If styling is active, allocate a layer for this window so that
-	// acme-lsp's highlights are composited independently of other tools.
-	// newStyleLayer mounts acme-styles fresh each time, so it survives
-	// acme-styles restarts without a persistent connection in FileManager.
-	if len(fm.styles) > 0 && winid >= 0 {
-		if layer, err := fm.newStyleLayer(winid); err != nil {
+	// If semantic highlighting is active, open (or reuse) the named layer for
+	// this window so acme-lsp's highlights are composited independently of
+	// other tools.  layer.Open mounts acme-styles fresh each call, so it
+	// survives acme-styles restarts without a persistent connection here.
+	if fm.cfg.SemanticHighlighting && winid >= 0 {
+		if sl, err := layer.Open(winid, layerName); err != nil {
 			log.Printf("acme-lsp: allocating style layer for window %d (%v): %v", winid, name, err)
 		} else {
 			fm.mu.Lock()
-			fm.styleLayers[winid] = layer
+			fm.styleLayers[winid] = sl
 			fm.mu.Unlock()
 		}
 		stop := make(chan struct{})
@@ -185,24 +182,6 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 
 	fm.applyStyles(winid, name)
 	return nil
-}
-
-// newStyleLayer allocates a fresh layer for the given acme window on the
-// acme-styles compositor.  A new connection to acme-styles is opened and
-// closed for the allocation; the returned StyleLayer holds no persistent
-// connection so it is resilient to acme-styles restarts.
-func (fm *FileManager) newStyleLayer(winid int) (*StyleLayer, error) {
-	fs, err := client.MountService("acme-styles")
-	if err != nil {
-		return nil, fmt.Errorf("acme-styles: %v", err)
-	}
-	defer fs.Close()
-
-	sl := &StyleLayer{winID: winid}
-	if err := sl.allocLayer(fs); err != nil {
-		return nil, fmt.Errorf("alloc layer for win %d: %v", winid, err)
-	}
-	return sl, nil
 }
 
 // watchBody polls the body of window winid every 300 ms.  When the content
@@ -277,7 +256,7 @@ func (fm *FileManager) notifyDidChange(name string, body []byte) {
 // corresponding highlights via the acme-styles layer.  Runs in its own
 // goroutine so as not to block the file-manager event loop.
 func (fm *FileManager) applyStyles(winid int, name string) {
-	if len(fm.styles) == 0 {
+	if !fm.cfg.SemanticHighlighting {
 		return
 	}
 	fm.mu.Lock()
@@ -287,7 +266,7 @@ func (fm *FileManager) applyStyles(winid int, name string) {
 
 	go func() {
 		err := fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
-			return ApplySemanticTokens(context.Background(), c, w, name, fm.styles, ts, layer)
+			return ApplySemanticTokens(context.Background(), c, w, name, ts, layer)
 		})
 		if err != nil && Verbose {
 			log.Printf("applyStyles %v: %v", name, err)
@@ -299,7 +278,7 @@ func (fm *FileManager) applyStyles(winid int, name string) {
 // the LSP server sends workspace/semanticTokens/refresh, re-styling every open
 // file.
 func (fm *FileManager) RefreshSemanticTokens() {
-	if len(fm.styles) == 0 {
+	if !fm.cfg.SemanticHighlighting {
 		return
 	}
 	wins, err := acme.Windows()
@@ -336,7 +315,7 @@ func (fm *FileManager) didClose(winid int, name string) error {
 	// Clear the acme-styles layer so highlights don't linger after close.
 	// Keyed by winID, not name, so tag-line renames don't orphan the entry.
 	if layer, ok := fm.styleLayers[winid]; ok {
-		layer.Clear() //nolint:errcheck
+		layer.Clear()
 		delete(fm.styleLayers, winid)
 	}
 
@@ -350,6 +329,21 @@ func (fm *FileManager) didClose(winid int, name string) error {
 	return fm.withClient(-1, name, func(c *Client, _ *acmeutil.Win) error {
 		return lsp.DidClose(context.Background(), c, name)
 	})
+}
+
+// DeleteAllLayers removes every acme-styles layer owned by the FileManager.
+// Call this on graceful shutdown so highlights don't linger in open windows
+// after the process exits.
+func (fm *FileManager) DeleteAllLayers() {
+	fm.mu.Lock()
+	layers := make([]*layer.StyleLayer, 0, len(fm.styleLayers))
+	for _, l := range fm.styleLayers {
+		layers = append(layers, l)
+	}
+	fm.mu.Unlock()
+	for _, l := range layers {
+		l.Delete()
+	}
 }
 
 func (fm *FileManager) didChange(winid int, name string) error {

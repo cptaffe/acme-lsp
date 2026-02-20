@@ -1,54 +1,17 @@
 package acmelsp
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"os"
-	"strconv"
-	"strings"
 	"unicode/utf8"
 
 	"9fans.net/acme-lsp/internal/acmeutil"
 	"9fans.net/acme-lsp/internal/lsp/text"
 	"9fans.net/internal/go-lsp/lsp/protocol"
-	"9fans.net/go/plan9"
-	"9fans.net/go/plan9/client"
+	"github.com/cptaffe/acme-styles/layer"
 )
-
-// StyleMap maps semantic token type name to a style index as defined in
-// the acme style file (index 0 = default/unset; named entries start at 1).
-type StyleMap map[string]int
-
-// LoadStyleFile parses an acme style file and returns a name→index map.
-// Index 0 is the "default" entry; subsequent named entries are 1, 2, …
-// Lines beginning with '#' are ignored.
-func LoadStyleFile(path string) (StyleMap, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	sm := make(StyleMap)
-	idx := 0
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		sm[fields[0]] = idx
-		idx++
-	}
-	return sm, sc.Err()
-}
 
 // semanticLegend extracts the SemanticTokensLegend from the server's
 // initialization result.  SemanticTokensProvider is typed interface{} in the
@@ -123,13 +86,10 @@ func blankLinesOnly(body []byte, ro *runeOffsets, gapStart, gapEnd int) bool {
 		return true
 	}
 	// Locate the byte offset of gapStart via the line table.
-	// lineStart[i] and lineStartByte[i] give us anchor points.
-	// Find the line whose lineStart is <= gapStart.
 	byteOff := 0
 	for l := len(ro.lineStart) - 1; l >= 0; l-- {
 		if ro.lineStart[l] <= gapStart {
 			byteOff = ro.lineStartByte[l]
-			// Advance byte-wise for any runes between lineStart[l] and gapStart.
 			skip := gapStart - ro.lineStart[l]
 			b := body[byteOff:]
 			for skip > 0 {
@@ -141,7 +101,6 @@ func blankLinesOnly(body []byte, ro *runeOffsets, gapStart, gapEnd int) bool {
 			break
 		}
 	}
-	// Walk runes from gapStart to gapEnd checking each is '\n'.
 	b := body[byteOff:]
 	for i := gapStart; i < gapEnd && len(b) > 0; i++ {
 		r, sz := utf8.DecodeRune(b)
@@ -153,111 +112,15 @@ func blankLinesOnly(body []byte, ro *runeOffsets, gapStart, gapEnd int) bool {
 	return true
 }
 
-// StyleEntry is a resolved (style-index, start-rune, end-rune) triple ready
-// for writing to an acme-styles layer or acme's native style file.
-// Start is inclusive, End is exclusive — matching acme's event coordinates.
-type StyleEntry struct {
-	StyleIdx int
-	Start    int
-	End      int // exclusive
-}
-
-// StyleLayer represents a single named layer owned by acme-lsp on the
-// acme-styles compositor for one acme window.  It holds no persistent
-// connection — each operation mounts acme-styles fresh so the layer
-// survives acme-styles restarts transparently.
-type StyleLayer struct {
-	winID   int
-	layerID int
-}
-
-func (sl *StyleLayer) mount() (*client.Fsys, error) {
-	return client.MountService("acme-styles")
-}
-
-// allocLayer opens <winid>/layers/new and reads back the assigned ID,
-// updating sl.layerID in place.
-func (sl *StyleLayer) allocLayer(fs *client.Fsys) error {
-	fid, err := fs.Open(fmt.Sprintf("%d/layers/new", sl.winID), plan9.OREAD)
-	if err != nil {
-		return err
-	}
-	var buf [32]byte
-	n, err := fid.Read(buf[:])
-	fid.Close()
-	if err != nil && n == 0 {
-		return fmt.Errorf("reading layer id: %v", err)
-	}
-	id, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
-	if err != nil {
-		return fmt.Errorf("parsing layer id %q: %v", string(buf[:n]), err)
-	}
-	sl.layerID = id
-	return nil
-}
-
-// Clear zeroes the layer.  Best-effort: if acme-styles is not running the
-// layer is already gone, so errors are silently ignored.
-func (sl *StyleLayer) Clear() error {
-	fs, err := sl.mount()
-	if err != nil {
-		return nil
-	}
-	defer fs.Close()
-	fid, err := fs.Open(fmt.Sprintf("%d/layers/%d/clear", sl.winID, sl.layerID), plan9.OWRITE)
-	if err != nil {
-		return nil
-	}
-	fid.Close()
-	return nil
-}
-
-// Apply writes entries to the layer.  Opening the style file with OWRITE
-// causes acme-styles to clear the layer atomically at open; the combined
-// flush (writeCtl → one winframesync) happens at fid clunk.
-//
-// If the layer no longer exists (acme-styles restarted) it is re-allocated
-// before writing.
-func (sl *StyleLayer) Apply(entries []StyleEntry) error {
-	fs, err := sl.mount()
-	if err != nil {
-		return err
-	}
-	defer fs.Close()
-
-	stylePath := fmt.Sprintf("%d/layers/%d/style", sl.winID, sl.layerID)
-	fid, err := fs.Open(stylePath, plan9.OWRITE)
-	if err != nil {
-		// Layer is gone — acme-styles restarted.  Re-allocate and retry.
-		if err2 := sl.allocLayer(fs); err2 != nil {
-			return fmt.Errorf("open style: %v; re-alloc: %v", err, err2)
-		}
-		fid, err = fs.Open(fmt.Sprintf("%d/layers/%d/style", sl.winID, sl.layerID), plan9.OWRITE)
-		if err != nil {
-			return err
-		}
-	}
-	defer fid.Close()
-
-	if len(entries) == 0 {
-		return nil // clunk alone flushes an empty composition → "style 0"
-	}
-	var sb strings.Builder
-	for _, e := range entries {
-		fmt.Fprintf(&sb, "%d %d %d\n", e.StyleIdx, e.Start, e.End)
-	}
-	_, err = fid.Write([]byte(sb.String()))
-	return err
-}
-
 // buildStyleEntries converts encoded LSP semantic token data into a flat slice
-// of StyleEntry values ready for writing to an acme-styles layer.
-// Returns nil if there are no mapped tokens.
-func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, sm StyleMap, body []byte) []StyleEntry {
+// of layer.Entry values ready for writing to an acme-styles layer.
+// Token type names are used directly as palette entry names (e.g. "keyword",
+// "comment") — the palette is maintained by acme-styles, not by acme-lsp.
+func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, body []byte) []layer.Entry {
 	ro := buildRuneOffsets(body)
 
 	// First pass: decode the relative encoding into absolute entries.
-	entries := make([]StyleEntry, 0, len(data)/5)
+	entries := make([]layer.Entry, 0, len(data)/5)
 	var line, col uint32
 	for i := 0; i+4 < len(data); i += 5 {
 		deltaLine := data[i]
@@ -276,29 +139,29 @@ func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, sm 
 		if int(tokenType) >= len(legend.TokenTypes) {
 			continue
 		}
-		styleIdx, ok := sm[legend.TokenTypes[tokenType]]
-		if !ok || styleIdx == 0 {
+		name := legend.TokenTypes[tokenType]
+		if name == "" {
 			continue
 		}
 		start := ro.toRuneOffset(int(line), int(col))
-		entries = append(entries, StyleEntry{
-			StyleIdx: styleIdx,
-			Start:    start,
-			End:      start + int(length),
+		entries = append(entries, layer.Entry{
+			Name:  name,
+			Start: start,
+			End:   start + int(length),
 		})
 	}
 
-	// Second pass: merge adjacent runs of the same style separated only by
+	// Second pass: merge adjacent runs of the same name separated only by
 	// blank lines.  gopls returns one token per line for multi-line constructs
 	// (backtick strings, block comments) and emits nothing for blank lines
 	// within them, even when multilineTokenSupport is advertised.
-	merged := make([]StyleEntry, 0, len(entries))
+	merged := make([]layer.Entry, 0, len(entries))
 	for i := 0; i < len(entries); i++ {
 		e := entries[i]
 		end := e.End
 		for j := i + 1; j < len(entries); j++ {
 			next := entries[j]
-			if next.StyleIdx != e.StyleIdx {
+			if next.Name != e.Name {
 				break
 			}
 			if !blankLinesOnly(body, ro, end, next.Start) {
@@ -307,7 +170,7 @@ func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, sm 
 			end = next.End
 			i = j
 		}
-		merged = append(merged, StyleEntry{StyleIdx: e.StyleIdx, Start: e.Start, End: end})
+		merged = append(merged, layer.Entry{Name: e.Name, Start: e.Start, End: end})
 	}
 
 	return merged
@@ -344,8 +207,8 @@ func applyTokenEdits(prev []uint32, edits []protocol.SemanticTokensEdit) []uint3
 // ts is the per-file token cache.  When ts holds a non-empty resultID the
 // function uses the LSP delta protocol (textDocument/semanticTokens/full/delta)
 // for efficiency; a full request is used on first call or after failure.
-func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name string, sm StyleMap, ts *tokenState, layer *StyleLayer) error {
-	if len(sm) == 0 || layer == nil {
+func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name string, ts *tokenState, sl *layer.StyleLayer) error {
+	if sl == nil {
 		return nil
 	}
 	legend, ok := semanticLegend(c.initializeResult.Capabilities)
@@ -408,7 +271,8 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 			return nil // non-fatal: server may not be ready yet
 		}
 		if result == nil || len(result.Data) == 0 {
-			return layer.Clear()
+			sl.Clear()
+			return nil
 		}
 		data = result.Data
 		newResultID = result.ResultID
@@ -421,5 +285,5 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 		ts.mu.Unlock()
 	}
 
-	return layer.Apply(buildStyleEntries(data, legend, sm, body))
+	return sl.Apply(buildStyleEntries(data, legend, body))
 }

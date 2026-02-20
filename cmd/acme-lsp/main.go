@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"9fans.net/acme-lsp/internal/lsp/acmelsp"
 	"9fans.net/acme-lsp/internal/lsp/acmelsp/config"
@@ -58,11 +60,25 @@ func main() {
 	flag.Usage = usage
 	cfg := cmd.Setup(config.LangServerFlags | config.ProxyFlags)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Delete all acme-styles layers on SIGTERM or SIGINT so highlights don't
+	// linger in open windows after the process exits.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+
 	app, err := NewApplication(ctx, cfg, flag.Args())
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
+
+	go func() {
+		<-sigs
+		app.fm.DeleteAllLayers()
+		cancel()
+	}()
+
 	err = app.Run(ctx)
 	if err != nil {
 		log.Fatalf("%v", err)
