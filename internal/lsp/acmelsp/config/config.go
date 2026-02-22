@@ -34,6 +34,12 @@ type File struct {
 	// Only required on systems without unix domain socket.
 	ProxyNetwork, ProxyAddress string
 
+	// P9Address is the service path for the 9P filesystem that exposes each
+	// managed language server as a named file.  On non-Plan 9 systems,
+	// 9pserve announces a unix socket at this path.  On Plan 9 the base name
+	// is posted to /srv.  Defaults to $NAMESPACE/acme-lsp.
+	P9Address string
+
 	// Network and address where acme is serving 9P file server.
 	// Only required on systems without unix domain socket.
 	AcmeNetwork, AcmeAddress string
@@ -133,6 +139,7 @@ func Default() *Config {
 		File: File{
 			ProxyNetwork:         "unix",
 			ProxyAddress:         filepath.Join(client.Namespace(), "acme-lsp.rpc"),
+			P9Address:            filepath.Join(client.Namespace(), "acme-lsp"),
 			AcmeNetwork:          "unix",
 			AcmeAddress:          filepath.Join(client.Namespace(), "acme"),
 			WorkspaceDirectories: nil,
@@ -192,6 +199,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.File.RootDirectory == "" {
 		cfg.File.RootDirectory = def.File.RootDirectory
+	}
+	if cfg.File.P9Address == "" {
+		cfg.File.P9Address = def.File.P9Address
 	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {

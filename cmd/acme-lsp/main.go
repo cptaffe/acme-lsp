@@ -105,6 +105,15 @@ func NewApplication(ctx context.Context, cfg *config.Config, args []string) (*Ap
 func (app *Application) Run(ctx context.Context) error {
 	go app.fm.Run()
 
+	// Start the 9P filesystem server that exposes each language server as a
+	// named file under the service path (default: $NAMESPACE/acme-lsp).
+	if conn, cleanup, err := listenP9FS(app.cfg.P9Address); err != nil {
+		log.Printf("acme-lsp: 9P filesystem unavailable: %v", err)
+	} else {
+		go func() { <-ctx.Done(); cleanup() }()
+		go acmelsp.ServeP9FS(ctx, conn, app.ss, app.fm)
+	}
+
 	err := acmelsp.ListenAndServeProxy(ctx, app.cfg, app.ss, app.fm)
 	if err != nil {
 		return fmt.Errorf("proxy failed: %v", err)
