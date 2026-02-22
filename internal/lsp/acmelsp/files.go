@@ -163,8 +163,8 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 
 	// If semantic highlighting is active, open (or reuse) the named layer for
 	// this window so acme-lsp's highlights are composited independently of
-	// other tools.  layer.Open mounts acme-styles fresh each call, so it
-	// survives acme-styles restarts without a persistent connection here.
+	// other tools.  layer.Open uses the shared long-lived connection to
+	// acme-styles established on first call.
 	if fm.cfg.SemanticHighlighting && winid >= 0 {
 		if sl, err := layer.Open(winid, layerName); err != nil {
 			log.Printf("acme-lsp: allocating style layer for window %d (%v): %v", winid, name, err)
