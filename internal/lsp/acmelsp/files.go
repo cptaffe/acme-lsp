@@ -78,18 +78,26 @@ func NewFileManager(ss *ServerSet, cfg *config.Config) (*FileManager, error) {
 // Run watches for files opened, closed, saved, or refreshed in acme
 // and tells LSP server about it. It also formats files when it's saved.
 func (fm *FileManager) Run() {
+	for {
+		if err := fm.runOnce(); err != nil {
+			log.Printf("file manager reading acme/log: %v", err)
+		}
+		// Acme exited or restarted; wait briefly then reconnect.
+		time.Sleep(time.Second)
+	}
+}
+
+func (fm *FileManager) runOnce() error {
 	alog, err := acme.Log()
 	if err != nil {
-		log.Printf("file manager opening acme/log: %v", err)
-		return
+		return err
 	}
 	defer alog.Close()
 
 	for {
 		ev, err := alog.Read()
 		if err != nil {
-			log.Printf("file manager reading acme/log: %v", err)
-			return
+			return err
 		}
 		switch ev.Op {
 		case "new":
