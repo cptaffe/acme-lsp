@@ -1,0 +1,25 @@
+# token_names.txt — maps LSP semantic token type names to short palette names.
+#
+# Format: <palette-name> <lsp-token-type>
+#   palette-name   short name used in ~/lib/acme/styles
+#   lsp-token-type name from the server's SemanticTokensLegend.tokenTypes
+#
+# Lines beginning with # and blank lines are ignored.
+# Token types not listed here are dropped so they do not occlude runs from
+# lower-priority layers with invisible (unmatched) spans.
+
+k keyword
+k modifier
+c comment
+s string
+t type
+t class
+t enum
+t interface
+t struct
+t typeParameter
+n number
+o operator
+m macro
+f function
+f method

@@ -2,9 +2,11 @@ package acmelsp
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"unicode/utf8"
 
 	"9fans.net/acme-lsp/internal/acmeutil"
@@ -113,33 +115,30 @@ func blankLinesOnly(body []byte, ro *runeOffsets, gapStart, gapEnd int) bool {
 }
 
 // lspPaletteNames maps LSP semantic token type names to the short palette
-// entry names used by the acme-styles master palette.  Token types with no
-// useful visual distinction (namespace, parameter, variable, …) are omitted
-// so that compose does not occlude lower-priority layers with unstyled runs.
-var lspPaletteNames = map[string]string{
-	// types
-	"class":         "t",
-	"enum":          "t",
-	"interface":     "t",
-	"struct":        "t",
-	"type":          "t",
-	"typeParameter": "t",
-	// functions
-	"function": "f",
-	"method":   "f",
-	// keywords
-	"keyword":  "k",
-	"modifier": "k",
-	// comments
-	"comment": "c",
-	// strings
-	"string": "s",
-	// numbers
-	"number": "n",
-	// operators
-	"operator": "o",
-	// macros / preprocessor
-	"macro": "m",
+// entry names used by the acme-styles master palette.  Populated at startup
+// from the embedded token_names.txt.  Token types not listed in the file are
+// dropped so they do not occlude lower-priority layers with invisible spans.
+var lspPaletteNames = parseTokenNames(tokenNamesData)
+
+//go:embed token_names.txt
+var tokenNamesData string
+
+// parseTokenNames parses the "<palette-name> <source-name>" format used by
+// token_names.txt and returns a source→palette map.
+// Lines starting with '#' and blank lines are ignored.
+func parseTokenNames(data string) map[string]string {
+	m := make(map[string]string)
+	for _, line := range strings.Split(data, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			m[fields[1]] = fields[0] // source → palette
+		}
+	}
+	return m
 }
 
 // buildStyleEntries converts encoded LSP semantic token data into a flat slice
