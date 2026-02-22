@@ -112,10 +112,41 @@ func blankLinesOnly(body []byte, ro *runeOffsets, gapStart, gapEnd int) bool {
 	return true
 }
 
+// lspPaletteNames maps LSP semantic token type names to the short palette
+// entry names used by the acme-styles master palette.  Token types with no
+// useful visual distinction (namespace, parameter, variable, …) are omitted
+// so that compose does not occlude lower-priority layers with unstyled runs.
+var lspPaletteNames = map[string]string{
+	// types
+	"class":         "t",
+	"enum":          "t",
+	"interface":     "t",
+	"struct":        "t",
+	"type":          "t",
+	"typeParameter": "t",
+	// functions
+	"function": "f",
+	"method":   "f",
+	// keywords
+	"keyword":  "k",
+	"modifier": "k",
+	// comments
+	"comment": "c",
+	// strings
+	"string": "s",
+	// numbers
+	"number": "n",
+	// operators
+	"operator": "o",
+	// macros / preprocessor
+	"macro": "m",
+}
+
 // buildStyleEntries converts encoded LSP semantic token data into a flat slice
 // of layer.Entry values ready for writing to an acme-styles layer.
-// Token type names are used directly as palette entry names (e.g. "keyword",
-// "comment") — the palette is maintained by acme-styles, not by acme-lsp.
+// LSP token type names are mapped to the short palette entry names defined in
+// lspPaletteNames; types with no palette equivalent are dropped so they do not
+// occlude runs from lower-priority layers.
 func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, body []byte) []layer.Entry {
 	ro := buildRuneOffsets(body)
 
@@ -139,7 +170,7 @@ func buildStyleEntries(data []uint32, legend *protocol.SemanticTokensLegend, bod
 		if int(tokenType) >= len(legend.TokenTypes) {
 			continue
 		}
-		name := legend.TokenTypes[tokenType]
+		name := lspPaletteNames[legend.TokenTypes[tokenType]]
 		if name == "" {
 			continue
 		}
