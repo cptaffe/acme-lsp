@@ -26,32 +26,40 @@ const proxyFileName = "ls"
 // ---- p9Session ----
 
 // p9Session holds per-fid state for a server file opened for writing or RDWR.
-// It bridges between the 9P write/read handlers and an in-process jsonrpc2
-// server connection.
 //
-// The client writes raw JSON-RPC objects via Write; the session frames them
-// with Content-Length headers and forwards them to a jsonrpc2 server running
-// in-process on the other end of a net.Pipe.  Responses from the server are
-// stripped of their headers and accumulated in rbuf; Read calls block until
-// data is available at the requested offset.
+// External protocol (JSONL-ish):
+//
+//   - Writes accumulate in a buffer; complete JSON objects are extracted with
+//     json.Decoder (newlines are not required — 9p rdwr strips the trailing
+//     \n via Brdstr before calling fswrite).  The session closes on Clunk.
+//
+//   - Reads use a simple rule:
+//       • If a request is in-flight (awaiting), block until the response
+//         arrives or the session ends.
+//       • If unread response data is available (lastGen < gen), return it.
+//       • Otherwise return 0 (9P EOF / no data).  This lets 9p rdwr, which
+//         reads before writing, proceed to send its first request without
+//         needing a pre-seeded buffer.
+//
+// Internally the session uses Content-Length-framed JSON-RPC over a net.Pipe
+// connected to an in-process jsonrpc2 server.
 type p9Session struct {
-	// wch carries raw JSON-RPC objects from the Write handler to the writer
-	// goroutine.  Closed by Clunk to initiate orderly shutdown.
-	wch chan []byte
+	wch       chan []byte // JSON-RPC bodies delivered to the writer goroutine
+	closeOnce sync.Once
 
-	// rbuf accumulates all response bytes ever received so that offset-based
-	// 9P reads can serve them correctly.  It is only appended to, never
-	// truncated.
-	mu        sync.Mutex
-	cond      *sync.Cond
-	rbuf      []byte
-	err       error // terminal error; nil while running
-	writeOnly bool  // when true, responses are discarded
+	mu       sync.Mutex
+	cond     *sync.Cond
+	curBuf   []byte // latest response body as a JSONL line (body + "\n")
+	gen      uint64 // incremented whenever curBuf is replaced
+	awaiting bool   // true while a request is in-flight
+	closed   bool   // true after session is closed
+	err      error  // terminal pipe error
+
+	writeOnly bool // if true, reads return 0 immediately
 }
 
-// newP9Session creates an in-process jsonrpc2 server backed by handler, then
-// starts goroutines to bridge between the session's channel/buffer and the
-// in-process pipe.
+// newP9Session starts an in-process jsonrpc2 server backed by handler and
+// launches writer and reader goroutines.
 func newP9Session(ctx context.Context, handler jsonrpc2.Handler, writeOnly bool) *p9Session {
 	s := &p9Session{
 		wch:       make(chan []byte, 16),
@@ -59,36 +67,33 @@ func newP9Session(ctx context.Context, handler jsonrpc2.Handler, writeOnly bool)
 	}
 	s.cond = sync.NewCond(&s.mu)
 
-	// pipeA is our end; pipeB is the jsonrpc2 server end.
 	pipeA, pipeB := net.Pipe()
 
-	// Start the jsonrpc2 server on pipeB.
+	// jsonrpc2 server on pipeB processes requests and sends responses.
 	streamB := jsonrpc2.NewBufferedStream(pipeB, jsonrpc2.VSCodeObjectCodec{})
 	jsonrpc2.NewConn(ctx, streamB, handler)
 
-	// Writer: drains wch, adds Content-Length framing, writes to pipeA.
-	// Closing wch (in Clunk) causes this goroutine to exit and close pipeA,
-	// which in turn causes the reader goroutine and the jsonrpc2 server to
-	// terminate.
+	// Writer goroutine: drains wch, adds Content-Length framing, writes to pipeA.
+	// Closing wch (via s.close) causes this goroutine to exit, closing pipeA,
+	// which shuts down the reader goroutine and the jsonrpc2 server on pipeB.
 	go func() {
 		defer pipeA.Close()
-		for data := range s.wch {
-			hdr := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(data))
+		for body := range s.wch {
+			hdr := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body))
 			if _, err := io.WriteString(pipeA, hdr); err != nil {
 				return
 			}
-			if _, err := pipeA.Write(data); err != nil {
+			if _, err := pipeA.Write(body); err != nil {
 				return
 			}
 		}
 	}()
 
-	// Reader: reads Content-Length-framed responses from pipeA, strips headers,
-	// appends raw JSON to rbuf, and wakes any blocked Read calls.
+	// Reader goroutine: reads Content-Length-framed responses, strips headers,
+	// and replaces curBuf with the raw JSON body as a JSONL line.
 	go func() {
 		r := bufio.NewReader(pipeA)
 		for {
-			// Parse header lines until blank line.
 			var length int
 			for {
 				line, err := r.ReadString('\n')
@@ -100,9 +105,12 @@ func newP9Session(ctx context.Context, handler jsonrpc2.Handler, writeOnly bool)
 				if line == "" {
 					break
 				}
-				var n int
-				if _, err := fmt.Sscanf(line, "Content-Length: %d", &n); err == nil && n > 0 {
-					length = n
+				if strings.HasPrefix(line, "Content-Length:") {
+					var n int
+					fmt.Sscanf(line, "Content-Length: %d", &n)
+					if n > 0 {
+						length = n
+					}
 				}
 			}
 			if length == 0 {
@@ -113,17 +121,27 @@ func newP9Session(ctx context.Context, handler jsonrpc2.Handler, writeOnly bool)
 				s.setErr(err)
 				return
 			}
-			if !writeOnly {
-				s.mu.Lock()
-				s.rbuf = append(s.rbuf, body...)
-				s.rbuf = append(s.rbuf, '\n')
-				s.cond.Signal()
-				s.mu.Unlock()
-			}
+			s.mu.Lock()
+			s.curBuf = append(body, '\n')
+			s.gen++
+			s.awaiting = false
+			s.cond.Broadcast()
+			s.mu.Unlock()
 		}
 	}()
 
 	return s
+}
+
+// close signals EOF.  Safe to call more than once.
+func (s *p9Session) close() {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.cond.Broadcast()
+		s.mu.Unlock()
+		close(s.wch)
+	})
 }
 
 func (s *p9Session) setErr(err error) {
@@ -135,30 +153,49 @@ func (s *p9Session) setErr(err error) {
 	s.mu.Unlock()
 }
 
-// read blocks until response bytes are available at offset, then copies into
-// data.  Returns 0, nil when writeOnly (immediate EOF in 9P).
-func (s *p9Session) read(data []byte, offset int64) (int, error) {
+// read delivers response data to the 9P client.  lastGen is per-fid and
+// tracks which response generation has already been delivered.
+//
+// Behaviour:
+//   - Block while a request is in-flight (awaiting).
+//   - Return curBuf[offset:] when there is new content (lastGen < gen).
+//     Advance lastGen only after the last byte of curBuf is delivered so
+//     that callers reading in chunks work correctly.
+//   - Return 0 in all other cases (no pending request, no new content).
+//     Returning 0 is what lets 9p rdwr unblock and proceed to write its
+//     first request.
+func (s *p9Session) read(data []byte, offset int64, lastGen *uint64) (int, error) {
 	if s.writeOnly {
 		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for int64(len(s.rbuf)) <= offset && s.err == nil {
+
+	// Block while a request is in-flight.
+	for s.awaiting && s.err == nil && !s.closed {
 		s.cond.Wait()
 	}
-	if int64(len(s.rbuf)) <= offset {
-		return 0, io.EOF
+
+	// Return new content if available.
+	if *lastGen < s.gen {
+		n := copy(data, s.curBuf[offset:])
+		if offset+int64(n) >= int64(len(s.curBuf)) {
+			*lastGen = s.gen
+		}
+		return n, nil
 	}
-	return copy(data, s.rbuf[offset:]), nil
+
+	// No pending request, no new content → 0 (lets 9p rdwr write next).
+	return 0, nil
 }
 
 // ---- directServerProxy ----
 
-// directServerProxy implements proxy.Server by forwarding all LSP methods
-// directly to a specific language server's protocol.Server connection, and
-// returning errors for acme-lsp-specific extension methods.
+// directServerProxy implements proxy.Server by forwarding all standard LSP
+// methods directly to a specific language server's protocol.Server connection.
+// acme-lsp extension methods return errors.
 type directServerProxy struct {
-	protocol.Server // forwards all LSP method calls
+	protocol.Server
 }
 
 func (p *directServerProxy) Version(context.Context) (int, error) {
@@ -193,16 +230,15 @@ type p9FidAux struct {
 	ft      int        // p9ftRoot or p9ftServer
 	srvName string     // server name (only meaningful for p9ftServer)
 	sess    *p9Session // nil for root or read-only fids
-	wbuf    []byte     // partial JSON accumulation between Write calls
+	wbuf    []byte     // incomplete data accumulation between Write calls
 	rbuf    []byte     // pre-built directory listing (root only)
+	lastGen uint64     // last p9Session.gen delivered to this fid
 }
 
 // p9FS implements the 9P virtual filesystem.
 //
-// The root directory lists one file per configured language server plus the
-// special "ls" file that proxies to the acme-lsp proxy server.  Opening a
-// file for writing (or RDWR) creates a p9Session; the client can then write
-// raw JSON-RPC objects and read back raw JSON-RPC responses.
+// Root directory lists one file per configured language server plus the
+// special "ls" file that proxies to the acme-lsp proxy server.
 type p9FS struct {
 	ctx context.Context
 	ss  *ServerSet
@@ -221,7 +257,6 @@ func (fs *p9FS) serverNames() []string {
 	return names
 }
 
-// serverQid returns a stable Qid for the given server file.
 func (fs *p9FS) serverQid(name string) plan9.Qid {
 	for i, n := range fs.serverNames() {
 		if n == name {
@@ -250,8 +285,6 @@ func (fs *p9FS) buildRootListing() []byte {
 }
 
 // handlerFor returns the jsonrpc2.Handler for the named server file.
-// "ls" maps to the proxy server; anything else maps directly to the
-// named language server's protocol.Server connection.
 func (fs *p9FS) handlerFor(srvName string) (jsonrpc2.Handler, error) {
 	if srvName == proxyFileName {
 		return proxy.NewServerHandler(&proxyServer{ss: fs.ss, fm: fs.fm}), nil
@@ -290,7 +323,6 @@ func (fs *p9FS) walk(ctx context.Context, fid, newfid *srv9p.Fid, names []string
 	a := fid.Aux().(*p9FidAux)
 
 	if len(names) == 0 {
-		// Clone: copy position to newfid.
 		ac := *a
 		newfid.SetAux(&ac)
 		return nil, nil
@@ -302,7 +334,6 @@ func (fs *p9FS) walk(ctx context.Context, fid, newfid *srv9p.Fid, names []string
 
 	for i, name := range names {
 		if curFt != p9ftRoot {
-			// Server files have no children; partial walk stops here.
 			break
 		}
 		var found bool
@@ -318,8 +349,7 @@ func (fs *p9FS) walk(ctx context.Context, fid, newfid *srv9p.Fid, names []string
 			}
 			break
 		}
-		qid := fs.serverQid(name)
-		qids = append(qids, qid)
+		qids = append(qids, fs.serverQid(name))
 		curFt = p9ftServer
 		curName = name
 	}
@@ -346,8 +376,7 @@ func (fs *p9FS) open(ctx context.Context, fid *srv9p.Fid, mode uint8) error {
 
 	case p9ftServer:
 		if m == plan9.OREAD {
-			// Read-only: no session needed; reads will return EOF immediately.
-			break
+			break // read-only: no session; reads return 0
 		}
 		handler, err := fs.handlerFor(a.srvName)
 		if err != nil {
@@ -365,11 +394,47 @@ func (fs *p9FS) read(ctx context.Context, fid *srv9p.Fid, data []byte, offset in
 		return fid.ReadBytes(data, offset, a.rbuf)
 	case p9ftServer:
 		if a.sess == nil {
-			return 0, nil // read-only: EOF
+			return 0, nil
 		}
-		return a.sess.read(data, offset)
+		return a.sess.read(data, offset, &a.lastGen)
 	}
 	return 0, fmt.Errorf("read: unknown file type")
+}
+
+// write appends data to an accumulation buffer and extracts complete JSON
+// objects via json.Decoder.  Newlines are not required: 9p rdwr strips the
+// trailing \n via Brdstr before calling fswrite, so the objects arrive as
+// plain JSON text.  The session closes when the fid is clunked.
+func (fs *p9FS) write(ctx context.Context, fid *srv9p.Fid, data []byte, offset int64) (int, error) {
+	a := fid.Aux().(*p9FidAux)
+	if a.sess == nil {
+		return 0, fmt.Errorf("not writable")
+	}
+
+	a.wbuf = append(a.wbuf, data...)
+
+	objs, rest := extractJSONObjects(a.wbuf)
+	a.wbuf = rest
+
+	for _, obj := range objs {
+		a.sess.mu.Lock()
+		if a.sess.closed {
+			a.sess.mu.Unlock()
+			break
+		}
+		if !a.sess.writeOnly {
+			a.sess.awaiting = true
+		}
+		a.sess.mu.Unlock()
+
+		select {
+		case a.sess.wch <- []byte(obj):
+		case <-ctx.Done():
+			return len(data), ctx.Err()
+		}
+	}
+
+	return len(data), nil
 }
 
 // extractJSONObjects scans data for complete top-level JSON values,
@@ -385,24 +450,6 @@ func extractJSONObjects(data []byte) ([]json.RawMessage, []byte) {
 		objs = append(objs, raw)
 	}
 	return objs, data[dec.InputOffset():]
-}
-
-func (fs *p9FS) write(ctx context.Context, fid *srv9p.Fid, data []byte, offset int64) (int, error) {
-	a := fid.Aux().(*p9FidAux)
-	if a.sess == nil {
-		return 0, fmt.Errorf("not writable")
-	}
-	a.wbuf = append(a.wbuf, data...)
-	objs, rest := extractJSONObjects(a.wbuf)
-	a.wbuf = rest
-	for _, obj := range objs {
-		select {
-		case a.sess.wch <- []byte(obj):
-		case <-ctx.Done():
-			return len(data), ctx.Err()
-		}
-	}
-	return len(data), nil
 }
 
 func (fs *p9FS) stat(ctx context.Context, fid *srv9p.Fid) (*plan9.Dir, error) {
@@ -434,16 +481,26 @@ func (fs *p9FS) clunk(fid *srv9p.Fid) {
 	if !ok || a == nil || a.sess == nil {
 		return
 	}
-	// Closing wch causes the writer goroutine to drain and exit.
-	// It then closes pipeA, which propagates EOF to the reader goroutine
-	// and terminates the jsonrpc2 server on pipeB.
-	close(a.sess.wch)
+	a.sess.close()
 }
 
-// ServeP9FS runs the 9P filesystem on conn until the connection is closed or
-// ctx is cancelled.  It is intended to be called in a goroutine.
-func ServeP9FS(ctx context.Context, conn io.ReadWriteCloser, ss *ServerSet, fm *FileManager) {
+// ServeP9FS accepts 9P client connections from ln and serves each in its own
+// goroutine.  Used on non-Plan 9 systems.  Blocks until ln is closed.
+func ServeP9FS(ctx context.Context, ln net.Listener, ss *ServerSet, fm *FileManager) {
+	defer ln.Close()
+	srv := (&p9FS{ctx: ctx, ss: ss, fm: fm}).Build()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go srv.Serve(conn, conn)
+	}
+}
+
+// ServeP9FSConn runs the 9P filesystem on a single bidirectional connection.
+// Used on Plan 9, where srv9p.Post returns a kernel-muxed pipe.
+func ServeP9FSConn(ctx context.Context, conn io.ReadWriteCloser, ss *ServerSet, fm *FileManager) {
 	defer conn.Close()
-	fs := &p9FS{ctx: ctx, ss: ss, fm: fm}
-	fs.Build().Serve(conn, conn)
+	(&p9FS{ctx: ctx, ss: ss, fm: fm}).Build().Serve(conn, conn)
 }
