@@ -112,12 +112,13 @@ func DidSave(ctx context.Context, server protocol.Server, filename string) error
 	})
 }
 
-func DidChange(ctx context.Context, server protocol.Server, filename string, body []byte) error {
+func DidChange(ctx context.Context, server protocol.Server, filename string, body []byte, version int32) error {
 	return server.DidChange(ctx, &protocol.DidChangeTextDocumentParams{
 		TextDocument: protocol.VersionedTextDocumentIdentifier{
 			TextDocumentIdentifier: protocol.TextDocumentIdentifier{
 				URI: text.ToURI(filename),
 			},
+			Version: version,
 		},
 		ContentChanges: []protocol.TextDocumentContentChangeEvent{
 			{

@@ -8,18 +8,23 @@
 # Token types not listed here are dropped so they do not occlude runs from
 # lower-priority layers with invisible (unmatched) spans.
 
-k keyword
-k modifier
-c comment
-s string
-t type
-t class
-t enum
-t interface
-t struct
-t typeParameter
-n number
-o operator
-m macro
-f function
-f method
+keyword keyword
+keyword modifier
+keyword import
+comment comment
+string string
+type type
+type class
+type enum
+type interface
+type struct
+type typeParameter
+number number
+operator operator
+macro macro
+function function
+function method
+namespace namespace
+variable variable
+variable parameter
+variable property

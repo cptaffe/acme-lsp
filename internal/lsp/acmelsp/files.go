@@ -21,12 +21,37 @@ import (
 // acme-styles highlight layer for each window.
 const layerName = "lsp"
 
-// tokenState caches the last semantic-token response for a file so that
-// subsequent requests can use the LSP delta protocol.
-type tokenState struct {
+// Bounded retry for the initial semantic-token request.  Some servers answer
+// before they finish indexing and return no tokens; these back-off retries
+// cover servers that do not send workspace/semanticTokens/refresh when they
+// become ready.  The loop stops as soon as tokens arrive, so files that
+// highlight immediately incur no extra requests.
+const (
+	semanticRetryAttempts = 5
+	semanticRetryInitial  = 500 * time.Millisecond
+	semanticRetryMax      = 4 * time.Second
+)
+
+// docState holds per-open-document state for a file: the monotonically
+// increasing LSP document version and the cached semantic-token response used
+// for the delta protocol.
+//
+// The version must strictly increase across didOpen/didChange for a given
+// document; servers such as terraform-ls silently drop a didChange whose
+// version is not greater than the last one they saw, which starves features
+// like semantic tokens.
+type docState struct {
 	mu       sync.Mutex
+	version  int32    // LSP document version
 	resultID string   // resultId from the last server response
 	data     []uint32 // flat token data from the last full or reconstructed response
+}
+
+func (d *docState) nextVersion() int32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.version++
+	return d.version
 }
 
 // FileManager keeps track of open files in acme.
@@ -38,10 +63,9 @@ type tokenState struct {
 // styling tools.
 type FileManager struct {
 	ss          *ServerSet
-	wins        map[string]struct{}     // set of open files (by name)
 	styleLayers map[int]*layer.StyleLayer // winID → layer; keyed by ID so tag-line renames don't break lookups
 	mu          sync.Mutex
-	tokenStates map[string]*tokenState  // cached token state per file; access protected by mu
+	docStates   map[string]*docState     // open files → per-document state (version + token cache); nil-absent means closed; protected by mu
 	watchers    map[string]chan struct{} // stop channels for per-window body watchers; access protected by mu
 
 	cfg *config.Config
@@ -51,9 +75,8 @@ type FileManager struct {
 func NewFileManager(ss *ServerSet, cfg *config.Config) (*FileManager, error) {
 	fm := &FileManager{
 		ss:          ss,
-		wins:        make(map[string]struct{}),
 		styleLayers: make(map[int]*layer.StyleLayer),
-		tokenStates: make(map[string]*tokenState),
+		docStates:   make(map[string]*docState),
 		watchers:    make(map[string]chan struct{}),
 		cfg:         cfg,
 	}
@@ -153,11 +176,10 @@ func (fm *FileManager) didOpen(winid int, name string) error {
 		fm.mu.Lock()
 		defer fm.mu.Unlock()
 
-		if _, ok := fm.wins[name]; ok {
+		if _, ok := fm.docStates[name]; ok {
 			return fmt.Errorf("file already open in file manager: %v", name)
 		}
-		fm.wins[name] = struct{}{}
-		fm.tokenStates[name] = &tokenState{}
+		fm.docStates[name] = &docState{}
 
 		b, err := w.ReadAll("body")
 		if err != nil {
@@ -246,16 +268,16 @@ func (fm *FileManager) watchBody(winid int, name string, stop <-chan struct{}) {
 // body content.  It is called from a goroutine inside watchBody.
 func (fm *FileManager) notifyDidChange(name string, body []byte) {
 	fm.mu.Lock()
-	_, open := fm.wins[name]
+	ds := fm.docStates[name]
 	fm.mu.Unlock()
-	if !open {
+	if ds == nil {
 		return
 	}
 	s, found, err := fm.ss.StartForFile(name)
 	if !found || err != nil {
 		return
 	}
-	if err := lsp.DidChange(context.Background(), s.Client, name, body); err != nil && Verbose {
+	if err := lsp.DidChange(context.Background(), s.Client, name, body, ds.nextVersion()); err != nil && Verbose {
 		log.Printf("notifyDidChange %v: %v", name, err)
 	}
 }
@@ -268,18 +290,47 @@ func (fm *FileManager) applyStyles(winid int, name string) {
 		return
 	}
 	fm.mu.Lock()
-	ts := fm.tokenStates[name]
+	ts := fm.docStates[name]
 	layer := fm.styleLayers[winid] // nil if acme-styles unavailable
 	fm.mu.Unlock()
 
+	// A server may answer the first request before it has finished indexing
+	// the workspace and return no tokens.  Servers that recover asynchronously
+	// usually send workspace/semanticTokens/refresh, which re-triggers this
+	// path; the bounded retry below covers servers that do not, and stops as
+	// soon as tokens arrive so files that highlight on the first try incur no
+	// extra requests.
 	go func() {
-		err := fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
-			return ApplySemanticTokens(context.Background(), c, w, name, ts, layer)
-		})
-		if err != nil && Verbose {
-			log.Printf("applyStyles %v: %v", name, err)
+		delay := semanticRetryInitial
+		for attempt := 0; ; attempt++ {
+			if fm.tryApplyStyles(winid, name, ts, layer) || attempt == semanticRetryAttempts {
+				return
+			}
+			time.Sleep(delay)
+			if delay *= 2; delay > semanticRetryMax {
+				delay = semanticRetryMax
+			}
 		}
 	}()
+}
+
+// tryApplyStyles performs one semantic-token request and returns true when the
+// server gave a definitive result (tokens applied, or highlighting impossible),
+// meaning no retry is warranted.
+func (fm *FileManager) tryApplyStyles(winid int, name string, ts *docState, sl *layer.StyleLayer) bool {
+	var applied bool
+	err := fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
+		var e error
+		applied, e = ApplySemanticTokens(context.Background(), c, w, name, ts, sl)
+		return e
+	})
+	if err != nil {
+		if Verbose {
+			log.Printf("applyStyles %v: %v", name, err)
+		}
+		return false
+	}
+	return applied
 }
 
 // RefreshSemanticTokens implements SemanticTokensRefresher.  It is called when
@@ -297,9 +348,9 @@ func (fm *FileManager) RefreshSemanticTokens() {
 		return
 	}
 	fm.mu.Lock()
-	open := make(map[string]int, len(fm.wins))
+	open := make(map[string]int, len(fm.docStates))
 	for _, info := range wins {
-		if _, ok := fm.wins[info.Name]; ok {
+		if _, ok := fm.docStates[info.Name]; ok {
 			open[info.Name] = info.ID
 		}
 	}
@@ -318,7 +369,6 @@ func (fm *FileManager) didClose(winid int, name string) error {
 		close(stop)
 		delete(fm.watchers, name)
 	}
-	delete(fm.tokenStates, name)
 
 	// Clear the acme-styles layer so highlights don't linger after close.
 	// Keyed by winID, not name, so tag-line renames don't orphan the entry.
@@ -327,13 +377,13 @@ func (fm *FileManager) didClose(winid int, name string) error {
 		delete(fm.styleLayers, winid)
 	}
 
-	if _, ok := fm.wins[name]; !ok {
-		fm.mu.Unlock()
-		return nil // Unknown language server.
-	}
-	delete(fm.wins, name)
+	_, open := fm.docStates[name]
+	delete(fm.docStates, name)
 	fm.mu.Unlock()
 
+	if !open {
+		return nil // Unknown language server.
+	}
 	return fm.withClient(-1, name, func(c *Client, _ *acmeutil.Win) error {
 		return lsp.DidClose(context.Background(), c, name)
 	})
@@ -358,7 +408,8 @@ func (fm *FileManager) didChange(winid int, name string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	if _, ok := fm.wins[name]; !ok {
+	ds := fm.docStates[name]
+	if ds == nil {
 		return nil // Unknown language server.
 	}
 	return fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
@@ -366,7 +417,7 @@ func (fm *FileManager) didChange(winid int, name string) error {
 		if err != nil {
 			return err
 		}
-		return lsp.DidChange(context.Background(), c, name, b)
+		return lsp.DidChange(context.Background(), c, name, b, ds.nextVersion())
 	})
 }
 
@@ -387,9 +438,9 @@ func (fm *FileManager) DidChange(winid int) error {
 
 func (fm *FileManager) didSave(winid int, name string) error {
 	fm.mu.Lock()
-	_, open := fm.wins[name]
+	ds := fm.docStates[name]
 	fm.mu.Unlock()
-	if !open {
+	if ds == nil {
 		return nil // Unknown language server.
 	}
 
@@ -399,8 +450,7 @@ func (fm *FileManager) didSave(winid int, name string) error {
 			return err
 		}
 
-		// TODO(fhs): Maybe DidChange is not needed with includeText option to DidSave?
-		err = lsp.DidChange(context.Background(), c, name, b)
+		err = lsp.DidChange(context.Background(), c, name, b, ds.nextVersion())
 		if err != nil {
 			return err
 		}
@@ -412,7 +462,7 @@ func (fm *FileManager) format(winid int, name string) error {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 
-	if _, ok := fm.wins[name]; !ok {
+	if _, ok := fm.docStates[name]; !ok {
 		return nil // Unknown language server.
 	}
 	return fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {

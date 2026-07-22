@@ -237,18 +237,24 @@ func applyTokenEdits(prev []uint32, edits []protocol.SemanticTokensEdit) []uint3
 // ts is the per-file token cache.  When ts holds a non-empty resultID the
 // function uses the LSP delta protocol (textDocument/semanticTokens/full/delta)
 // for efficiency; a full request is used on first call or after failure.
-func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name string, ts *tokenState, sl *layer.StyleLayer) error {
+//
+// The returned bool reports whether the server produced a definitive result:
+// true when tokens were applied, or when this document can never be highlighted
+// (highlighting off, or the server advertises no semantic-token support).  It
+// is false when the server returned nothing, which may mean it has not finished
+// indexing yet; callers may retry in that case.
+func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name string, ts *docState, sl *layer.StyleLayer) (bool, error) {
 	if sl == nil {
-		return nil
+		return true, nil
 	}
 	legend, ok := semanticLegend(c.initializeResult.Capabilities)
 	if !ok {
-		return nil
+		return true, nil
 	}
 
 	body, err := w.ReadAll("body")
 	if err != nil {
-		return fmt.Errorf("reading body: %v", err)
+		return false, fmt.Errorf("reading body: %v", err)
 	}
 
 	var prevResultID string
@@ -298,11 +304,11 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 			if Verbose {
 				log.Printf("SemanticTokensFull %v: %v", name, err)
 			}
-			return nil // non-fatal: server may not be ready yet
+			return false, nil // server may not be ready yet; caller may retry
 		}
 		if result == nil || len(result.Data) == 0 {
 			sl.Clear()
-			return nil
+			return false, nil // nothing yet; caller may retry
 		}
 		data = result.Data
 		newResultID = result.ResultID
@@ -315,5 +321,5 @@ func ApplySemanticTokens(ctx context.Context, c *Client, w *acmeutil.Win, name s
 		ts.mu.Unlock()
 	}
 
-	return sl.Apply(buildStyleEntries(data, legend, body))
+	return true, sl.Apply(buildStyleEntries(data, legend, body))
 }
