@@ -88,7 +88,7 @@ func DidOpen(ctx context.Context, server protocol.Server, filename string, lang 
 	return server.DidOpen(ctx, &protocol.DidOpenTextDocumentParams{
 		TextDocument: protocol.TextDocumentItem{
 			URI:        text.ToURI(filename),
-			LanguageID: lang,
+			LanguageID: protocol.LanguageKind(lang),
 			Version:    0,
 			Text:       string(body),
 		},

@@ -92,7 +92,7 @@ func (rc *RemoteCmd) Completion(ctx context.Context, kind CompletionKind) error 
 	if err != nil {
 		return err
 	}
-	result, err := rc.server.Completion(ctx, &protocol.CompletionParams{
+	res, err := rc.server.Completion(ctx, &protocol.CompletionParams{
 		TextDocumentPositionParams: *pos,
 		Context: protocol.CompletionContext{
 			// Completion was triggered by an explicit manual user invocation.
@@ -102,19 +102,26 @@ func (rc *RemoteCmd) Completion(ctx context.Context, kind CompletionKind) error 
 	if err != nil {
 		return err
 	}
+	result := completionListFromResult(res)
+	if result == nil {
+		result = &protocol.CompletionList{}
+	}
 
 	if (kind == CompleteInsertFirstMatch && len(result.Items) >= 1) || (kind == CompleteInsertOnlyMatch && len(result.Items) == 1) {
 		textEdit := result.Items[0].TextEdit
-		if textEdit == nil {
+		switch edit := textEdit.Value.(type) {
+		default:
+			return fmt.Errorf("unsupported completion text edit %T", edit)
+		case nil:
 			// TODO(fhs): Use insertText or label instead.
 			return fmt.Errorf("nil TextEdit in completion item")
-		}
-		if err := text.Edit(w, []protocol.TextEdit{*textEdit}); err != nil {
-			return fmt.Errorf("failed to apply completion edit: %v", err)
-		}
-
-		if len(result.Items) == 1 {
-			return nil
+		case protocol.TextEdit:
+			if err := text.Edit(w, []protocol.TextEdit{edit}); err != nil {
+				return fmt.Errorf("failed to apply completion edit: %v", err)
+			}
+			if len(result.Items) == 1 {
+				return nil
+			}
 		}
 	}
 
@@ -155,11 +162,15 @@ func (rc *RemoteCmd) Definition(ctx context.Context, print bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to get position: %v", err)
 	}
-	locations, err := rc.server.Definition(ctx, &protocol.DefinitionParams{
+	result, err := rc.server.Definition(ctx, &protocol.DefinitionParams{
 		TextDocumentPositionParams: *pos,
 	})
 	if err != nil {
 		return fmt.Errorf("bad server response: %v", err)
+	}
+	locations := locationsFromDefinition(result)
+	if len(locations) == 0 {
+		return fmt.Errorf("no definition found")
 	}
 	if print {
 		return PrintLocations(rc.Stdout, locations)
@@ -210,7 +221,7 @@ func (rc *RemoteCmd) Hover(ctx context.Context) error {
 		switch v := c.Value.(type) {
 		case string:
 			fmt.Fprintln(rc.Stdout, v)
-		case protocol.Msg_MarkedString:
+		case protocol.MarkedStringWithLanguage:
 			fmt.Fprintln(rc.Stdout, v.Value)
 		}
 	case protocol.MarkupContent:
@@ -220,7 +231,7 @@ func (rc *RemoteCmd) Hover(ctx context.Context) error {
 			switch v := ms.Value.(type) {
 			case string:
 				fmt.Fprintln(rc.Stdout, v)
-			case protocol.Msg_MarkedString:
+			case protocol.MarkedStringWithLanguage:
 				fmt.Fprintln(rc.Stdout, v.Value)
 			}
 		}
@@ -275,9 +286,8 @@ func (rc *RemoteCmd) Rename(ctx context.Context, newname string) error {
 		return err
 	}
 	we, err := rc.server.Rename(ctx, &protocol.RenameParams{
-		TextDocument: pos.TextDocument,
-		Position:     pos.Position,
-		NewName:      newname,
+		TextDocumentPositionParams: *pos,
+		NewName:                    newname,
 	})
 	if err != nil {
 		return err
@@ -355,11 +365,15 @@ func (rc *RemoteCmd) TypeDefinition(ctx context.Context, print bool) error {
 	if err != nil {
 		return err
 	}
-	locations, err := rc.server.TypeDefinition(ctx, &protocol.TypeDefinitionParams{
+	result, err := rc.server.TypeDefinition(ctx, &protocol.TypeDefinitionParams{
 		TextDocumentPositionParams: *pos,
 	})
 	if err != nil {
 		return err
+	}
+	locations := locationsFromTypeDefinition(result)
+	if len(locations) == 0 {
+		return fmt.Errorf("no type definition found")
 	}
 	if print {
 		return PrintLocations(rc.Stdout, locations)
@@ -399,6 +413,76 @@ func (rc *RemoteCmd) Execute(ctx context.Context, command string, args []string)
 		},
 	})
 	return json.NewEncoder(rc.Stdout).Encode(resp)
+}
+
+// completionListFromResult unwraps the textDocument/completion result, which the
+// LSP spec allows to be either a CompletionList or a []CompletionItem.
+func completionListFromResult(result *protocol.Or_Result_textDocument_completion) *protocol.CompletionList {
+	if result == nil {
+		return nil
+	}
+	switch v := result.Value.(type) {
+	case protocol.CompletionList:
+		return &v
+	case []protocol.CompletionItem:
+		return &protocol.CompletionList{Items: v}
+	}
+	return nil
+}
+
+// locationsFromDefinition converts an Or_Result_textDocument_definition
+// response to a flat []Location. The LSP spec allows the response to be a single
+// Location, a []Location (via Definition = Or_Definition), or []LocationLink.
+func locationsFromDefinition(result *protocol.Or_Result_textDocument_definition) []protocol.Location {
+	if result == nil {
+		return nil
+	}
+	switch v := result.Value.(type) {
+	case protocol.Definition:
+		switch lv := v.Value.(type) {
+		case protocol.Location:
+			return []protocol.Location{lv}
+		case []protocol.Location:
+			return lv
+		}
+	case []protocol.DefinitionLink:
+		locs := make([]protocol.Location, len(v))
+		for i, dl := range v {
+			locs[i] = protocol.Location{
+				URI:   dl.TargetURI,
+				Range: dl.TargetSelectionRange,
+			}
+		}
+		return locs
+	}
+	return nil
+}
+
+// locationsFromTypeDefinition converts an Or_Result_textDocument_typeDefinition
+// response to a flat []Location, mirroring locationsFromDefinition.
+func locationsFromTypeDefinition(result *protocol.Or_Result_textDocument_typeDefinition) []protocol.Location {
+	if result == nil {
+		return nil
+	}
+	switch v := result.Value.(type) {
+	case protocol.Definition:
+		switch lv := v.Value.(type) {
+		case protocol.Location:
+			return []protocol.Location{lv}
+		case []protocol.Location:
+			return lv
+		}
+	case []protocol.DefinitionLink:
+		locs := make([]protocol.Location, len(v))
+		for i, dl := range v {
+			locs[i] = protocol.Location{
+				URI:   dl.TargetURI,
+				Range: dl.TargetSelectionRange,
+			}
+		}
+		return locs
+	}
+	return nil
 }
 
 func walkDocumentSymbols1(syms []protocol.DocumentSymbol, depth int, f func(s *protocol.DocumentSymbol, depth int)) {

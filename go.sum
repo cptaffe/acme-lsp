@@ -1,7 +1,7 @@
 9fans.net/go v0.0.7 h1:H5CsYJTf99C8EYAQr+uSoEJnLP/iZU8RmDuhyk30iSM=
 9fans.net/go v0.0.7/go.mod h1:Rxvbbc1e+1TyGMjAvLthGTyO97t+6JMQ6ly+Lcs9Uf0=
-9fans.net/internal/go-lsp v0.0.0-20250703040020-27c2c9b7d354 h1:beLJphkepxIWpAygxhjD+PA+AclTGTNPonrCw2LmNWE=
-9fans.net/internal/go-lsp v0.0.0-20250703040020-27c2c9b7d354/go.mod h1:0/rCSlZo+66g+WpzTJuod4f7dHG6Yo8kxehfOhrt9RU=
+9fans.net/internal/go-lsp v0.0.0-20260327195721-1abc868fff35 h1:N01qjR4tUmHSz15y12vSbiskxuYg5IAG2EEtylSfPRw=
+9fans.net/internal/go-lsp v0.0.0-20260327195721-1abc868fff35/go.mod h1:vRyAv+YXrmweQ/TkOV2wsLcQSKr5lgFITownQZWrcTE=
 dmitri.shuralyov.com/gpu/mtl v0.0.0-20201218220906-28db891af037/go.mod h1:H6x//7gZCb22OMCxBHrMx7a5I7Hp++hsVxbQ4BYO7hU=
 github.com/BurntSushi/toml v0.3.1 h1:WXkYYl6Yr3qBf1K79EBnL4mak0OimBfB0XUf9Vl28OQ=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=

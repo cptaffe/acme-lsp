@@ -19,6 +19,34 @@ import (
 	"9fans.net/internal/go-lsp/lsp/protocol"
 )
 
+// hoverText extracts a plain-text string from a hover result, which the LSP
+// spec allows to be MarkupContent, a MarkedString, or a []MarkedString.
+func hoverText(v interface{}) string {
+	switch c := v.(type) {
+	case protocol.MarkupContent:
+		return c.Value
+	case protocol.MarkedString:
+		switch s := c.Value.(type) {
+		case string:
+			return s
+		case protocol.MarkedStringWithLanguage:
+			return s.Value
+		}
+	case []protocol.MarkedString:
+		var sb strings.Builder
+		for _, ms := range c {
+			switch s := ms.Value.(type) {
+			case string:
+				sb.WriteString(s)
+			case protocol.MarkedStringWithLanguage:
+				sb.WriteString(s.Value)
+			}
+		}
+		return sb.String()
+	}
+	return ""
+}
+
 const goSource = `package main // import "example.com/test"
 
 import "fmt"
@@ -150,7 +178,7 @@ func TestGoHover(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Hover failed: %v", err)
 			}
-			got := hov.Contents.Value
+			got := hoverText(hov.Contents.Value)
 			// Instead of doing an exact match, we ignore extra markups
 			// from markdown (if there are any).
 			if !strings.Contains(got, srv.want) {
@@ -411,7 +439,7 @@ func TestPythonHover(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Hover failed: %v", err)
 		}
-		got := hov.Contents.Value
+		got := hoverText(hov.Contents.Value)
 		want := "Return the square root of x."
 		// May not be an exact match.
 		// Perhaps depending on if it's Python 2 or 3?
