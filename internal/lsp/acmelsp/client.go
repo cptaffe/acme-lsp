@@ -2,6 +2,7 @@ package acmelsp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -147,6 +148,34 @@ func (c *Client) Close() error {
 	return c.rpc.Close()
 }
 
+// initParams wraps ParamInitialize to serialize rootUri as JSON null when
+// there is no workspace root.  The go-lsp RootURI field is a plain string with
+// no omitempty, so it otherwise marshals as "rootUri":"", which the LSP spec
+// disallows (rootUri must be null when no folder is open) and strict servers
+// such as taplo reject outright.
+type initParams struct {
+	params  *protocol.ParamInitialize
+	hasRoot bool
+}
+
+func (p *initParams) MarshalJSON() ([]byte, error) {
+	b, err := json.Marshal(p.params)
+	if err != nil {
+		return nil, err
+	}
+	if p.hasRoot {
+		return b, nil
+	}
+	// Rewrite the empty rootUri string to null.  The value is always "" here
+	// (init only builds initParams with hasRoot=false when rootURI is unset).
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	m["rootUri"] = json.RawMessage("null")
+	return json.Marshal(m)
+}
+
 func (c *Client) init(conn net.Conn, cfg *ClientConfig) error {
 	ctx := context.Background()
 	stream := jsonrpc2.NewBufferedStream(conn, jsonrpc2.VSCodeObjectCodec{})
@@ -183,8 +212,15 @@ func (c *Client) init(conn net.Conn, cfg *ClientConfig) error {
 	// lie every server would mis-scope on; terraform-ls makes it fatal by
 	// eagerly walking the whole disk at init and crashing.  Only send rootUri
 	// when a real root was explicitly configured (via -rootdir or config).
+	//
+	// hasRoot drives the null-vs-string decision at marshal time: the go-lsp
+	// RootURI field has no omitempty and is a plain string, so an empty value
+	// serializes as "rootUri":"" — which strict servers such as taplo reject
+	// with -32602 ("expected relative URL without a base").  initParams below
+	// rewrites it to JSON null when there is no root.
 	var rootURI protocol.DocumentURI
-	if d != "/" && d != `C:\` {
+	hasRoot := d != "/" && d != `C:\`
+	if hasRoot {
 		rootURI = text.ToURI(d)
 	}
 	params := &protocol.ParamInitialize{
@@ -246,8 +282,8 @@ func (c *Client) init(conn net.Conn, cfg *ClientConfig) error {
 		},
 	}
 
-	result, err := server.Initialize(ctx, params)
-	if err != nil {
+	var result *protocol.InitializeResult
+	if err := c.rpc.Call(ctx, "initialize", &initParams{params, hasRoot}, &result); err != nil {
 		return fmt.Errorf("initialize failed: %v", err)
 	}
 	if err := server.Initialized(ctx, &protocol.InitializedParams{}); err != nil {
