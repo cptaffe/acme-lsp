@@ -92,6 +92,13 @@ func execServer(cs *config.Server, cfg *ClientConfig, restartOnExit bool) (*Serv
 					log.Printf("initialize after server restart failed: %v", err)
 					cmd.Process.Kill()
 					srv.conn.Close()
+					return
+				}
+				// The restarted process has an empty document store.  Replay
+				// didOpen for every open file so requests don't fail with
+				// "document not found" until each file is manually reopened.
+				if cfg.Resyncer != nil {
+					cfg.Resyncer.ResyncFiles()
 				}
 			}()
 		}
@@ -158,6 +165,7 @@ type ServerSet struct {
 	Data            []*ServerInfo
 	diagWriter      DiagnosticsWriter
 	tokensRefresher SemanticTokensRefresher // notified on workspace/semanticTokens/refresh
+	resyncer        ServerResyncer          // notified after a server restart to replay didOpen
 	workspaces      map[string]*protocol.WorkspaceFolder // set of workspace folders
 	cfg             *config.Config
 }
@@ -242,6 +250,7 @@ func (ss *ServerSet) ClientConfig(info *ServerInfo) *ClientConfig {
 		Workspaces:      ss.Workspaces(),
 		Logger:          info.Logger,
 		TokensRefresher: ss.tokensRefresher,
+		Resyncer:        ss.resyncer,
 	}
 }
 

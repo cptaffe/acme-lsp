@@ -104,6 +104,15 @@ type SemanticTokensRefresher interface {
 	RefreshSemanticTokens()
 }
 
+// ServerResyncer is notified after a language server is restarted (following a
+// crash or exit) and re-initialized.  A freshly started process has an empty
+// document store, so the implementation must re-send textDocument/didOpen for
+// the open files it tracks; otherwise every subsequent request fails with
+// "document not found" until each file is manually reopened.
+type ServerResyncer interface {
+	ResyncFiles()
+}
+
 // ClientConfig contains LSP client configuration values.
 type ClientConfig struct {
 	*config.Server
@@ -115,6 +124,7 @@ type ClientConfig struct {
 	Workspaces         []protocol.WorkspaceFolder // initial workspace folders
 	Logger             *log.Logger
 	TokensRefresher    SemanticTokensRefresher    // called on workspace/semanticTokens/refresh; may be nil
+	Resyncer           ServerResyncer             // called after a server restart to replay didOpen; may be nil
 }
 
 // Client represents a LSP client connection.

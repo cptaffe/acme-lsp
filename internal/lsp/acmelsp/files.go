@@ -54,6 +54,17 @@ func (d *docState) nextVersion() int32 {
 	return d.version
 }
 
+// reset clears the document version and cached token response.  Called when a
+// file is re-opened against a freshly restarted server, whose document store
+// (and token result IDs) no longer match the cached state.
+func (d *docState) reset() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.version = 0
+	d.resultID = ""
+	d.data = nil
+}
+
 // FileManager keeps track of open files in acme.
 // It is used to synchronize text with LSP server.
 //
@@ -81,6 +92,7 @@ func NewFileManager(ss *ServerSet, cfg *config.Config) (*FileManager, error) {
 		cfg:         cfg,
 	}
 
+	ss.resyncer = fm
 	if cfg.SemanticHighlighting {
 		ss.tokensRefresher = fm
 	}
@@ -359,6 +371,61 @@ func (fm *FileManager) RefreshSemanticTokens() {
 	for name, id := range open {
 		fm.applyStyles(id, name)
 	}
+}
+
+// ResyncFiles implements ServerResyncer.  After a language server restarts its
+// document store is empty, so it re-sends textDocument/didOpen for every open
+// file.  Files whose server did not restart are re-opened too; a redundant
+// didOpen is harmless, and this keeps the routing (by filename, in withClient)
+// identical to the normal open path.
+func (fm *FileManager) ResyncFiles() {
+	wins, err := acme.Windows()
+	if err != nil {
+		log.Printf("ResyncFiles: listing windows: %v", err)
+		return
+	}
+	fm.mu.Lock()
+	open := make(map[string]int, len(fm.docStates))
+	for _, info := range wins {
+		if _, ok := fm.docStates[info.Name]; ok {
+			open[info.Name] = info.ID
+		}
+	}
+	fm.mu.Unlock()
+
+	for name, id := range open {
+		if err := fm.reopen(id, name); err != nil {
+			log.Printf("ResyncFiles: reopening %v: %v", name, err)
+		}
+	}
+}
+
+// reopen re-sends didOpen for an already-tracked file, resetting its document
+// version so the restarted server accepts subsequent didChange notifications.
+// It is the restart-recovery counterpart to didOpen, which refuses files that
+// are already tracked.
+func (fm *FileManager) reopen(winid int, name string) error {
+	err := fm.withClient(winid, name, func(c *Client, w *acmeutil.Win) error {
+		fm.mu.Lock()
+		ds, ok := fm.docStates[name]
+		if !ok {
+			fm.mu.Unlock()
+			return nil // closed since the snapshot was taken
+		}
+		ds.reset()
+		fm.mu.Unlock()
+
+		b, err := w.ReadAll("body")
+		if err != nil {
+			return err
+		}
+		return lsp.DidOpen(context.Background(), c, name, c.cfg.FilenameHandler.LanguageID, b)
+	})
+	if err != nil {
+		return err
+	}
+	fm.applyStyles(winid, name)
+	return nil
 }
 
 func (fm *FileManager) didClose(winid int, name string) error {
