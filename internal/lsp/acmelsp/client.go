@@ -165,9 +165,21 @@ func (c *Client) init(conn net.Conn, cfg *ClientConfig) error {
 	if err != nil {
 		return err
 	}
+	// acme-lsp edits individual files and has no single workspace root, so
+	// RootDirectory defaults to the filesystem root ("/" or `C:\`) as a
+	// "no root" sentinel.  Per the LSP spec rootUri must be null when no
+	// folder is open, and is anyway deprecated in favour of workspaceFolders,
+	// which we always send.  Advertising the filesystem root as rootUri is a
+	// lie every server would mis-scope on; terraform-ls makes it fatal by
+	// eagerly walking the whole disk at init and crashing.  Only send rootUri
+	// when a real root was explicitly configured (via -rootdir or config).
+	var rootURI protocol.DocumentURI
+	if d != "/" && d != `C:\` {
+		rootURI = text.ToURI(d)
+	}
 	params := &protocol.ParamInitialize{
 		XInitializeParams: protocol.XInitializeParams{
-			RootURI: text.ToURI(d),
+			RootURI: rootURI,
 			Capabilities: protocol.ClientCapabilities{
 				TextDocument: protocol.TextDocumentClientCapabilities{
 					CodeAction: protocol.CodeActionClientCapabilities{
